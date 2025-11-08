@@ -1,0 +1,7 @@
+# Ignore local API credentials and other local-only API modules
+api/
+
+.vs/FederalBillBot/v17/DocumentLayout.json
+.vs/VSWorkspaceState.json
+.vs/FederalBillBot/v17/.wsuo
+.vs/ProjectSettings.json
