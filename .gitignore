@@ -1,6 +1,13 @@
 # Ignore local API credentials and other local-only API modules
 api/
 
+# Local database 
+sqlite/
+
+#Test Folder
+Internal_Test_Ignore/
+
+# Visual Studio user files
 .vs/FederalBillBot/v17/DocumentLayout.json
 .vs/VSWorkspaceState.json
 .vs/FederalBillBot/v17/.wsuo
