@@ -1,17 +1,17 @@
 
 # FederalBillBot
 
-FederalBillBot is an automated bot that scans Congress.gov for new congressional legislation and logs each new bill.
+FederalBillBot is an automated bot that scans Congress.gov for new congressional legislation and logs each new bill every 15 minutes. Currently just scans for a new legislation that has been introduced. 
 
 ## How it works
 
-- The main script (`congress_x_post_processor/x_congress_monitor_main.py`) polls a Congress.gov RSS feed for new bills.
-- When a new bill is detected, it is logged to a SQLite database (TBD).
+- The script (`congress_x_post_processor/x_congress_monitor_initial_introduced.py`) polls a Congress.gov RSS feed for new bills.
+- When a new bill is detected, it is logged to a SQLite database.
 - The script checks the database to avoid logging the same bill twice.
-- All X (Twitter) posting logic is separated into `congress_x_post_processor/x_poster.py`.
+- All X posting logic is separated into `congress_x_post_processor/x_poster.py`.
 
 
 ## Notes
 
-- The `api/` folder is ignored by git for local credentials.
-- The Script is currently in dev and not functioning. 
+- The `api/` and 'sqlite' folder is ignored by git based upon the security of local credentials
+- The Script is currently in dev posting to X, all post until this read me are current post test. 

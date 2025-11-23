@@ -1,6 +1,14 @@
 # Ignore local API credentials and other local-only API modules
 api/
 
+#Ignore sqlite database files
+*.sqlite
+*.db
+sqlite/
+
+#ignore internal Test files no relevancy to the project
+internal_test_ignore/
+
 .vs/FederalBillBot/v17/DocumentLayout.json
 .vs/VSWorkspaceState.json
 .vs/FederalBillBot/v17/.wsuo
