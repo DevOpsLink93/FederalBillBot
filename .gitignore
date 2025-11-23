@@ -9,6 +9,13 @@ sqlite/
 #ignore internal Test files no relevancy to the project
 internal_test_ignore/
 
+# Local database 
+sqlite/
+
+#Test Folder
+Internal_Test_Ignore/
+
+# Visual Studio user files
 .vs/FederalBillBot/v17/DocumentLayout.json
 .vs/VSWorkspaceState.json
 .vs/FederalBillBot/v17/.wsuo

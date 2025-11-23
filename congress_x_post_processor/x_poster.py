@@ -4,7 +4,9 @@ XPoster: Post new congressional legislation to X (Twitter).
 Usage:
     from x_poster import XPoster
     poster = XPoster()
-    poster.post_bill(bill_number, date_introduced, sponsor, summary, link)
+    poster.post_bill(docnum, title, link)
+
+This file is not used by the main monitor script. Integrate as needed.
 """
 
 import logging
@@ -17,110 +19,52 @@ except ImportError:
 
 LOG = logging.getLogger("x_poster")
 
-
 class XPoster:
     def __init__(self):
         from typing import Any
         self.client: Optional[Any] = None
         try:
-            from api.x_api_call import get_x_api_client  # type: ignore
-            # Get the X API client directly
-            self.client = get_x_api_client()
-            LOG.info("X API client initialized successfully")
-        except ImportError as e:
-            LOG.warning(f"Failed to import x_api_call: {e}")
-            LOG.info("Running in test mode (posting disabled)")
-        except Exception as e:
-            LOG.exception(f"Failed to initialize X API client: {e}")
-            LOG.info("Running in test mode (posting disabled)")
-        
-        if not self.client and tweepy:
-            LOG.warning("Tweepy is available but no client was created. Running in test mode.")
-        elif not tweepy:
-            LOG.warning("Tweepy not installed. Install with: pip install tweepy")
-            LOG.info("Running in test mode (posting disabled)")
+            from api.x_api_call import get_twitter_credentials  # type: ignore
+        except Exception:
+            get_twitter_credentials = None
+        creds = get_twitter_credentials() if get_twitter_credentials else None
+        if creds and tweepy:
+            ck = creds.get("api_key")
+            cs = creds.get("api_secret")
+            at = creds.get("access_token")
+            ats = creds.get("access_token_secret")
+            if ck and cs and at and ats:
+                try:
+                    self.client = tweepy.Client(
+                        consumer_key=ck,
+                        consumer_secret=cs,
+                        access_token=at,
+                        access_token_secret=ats,
+                    )
+                except Exception:
+                    LOG.exception("Failed to create Tweepy client")
+        else:
+            LOG.info("No credentials or Tweepy not installed; running in dry-run mode")
 
-    def post_bill(self, bill_number: str, date_introduced: str, sponsor: str, summary: str, link: str) -> bool:
-        """
-        Print bill information and post to X.com.
-        For testing, actual posting is commented out.
-        """
-        # Print all values in order as specified
-        print(f"Bill Number: {bill_number}")
-        print(f"Date Introduced: {date_introduced}")
-        print(f"Sponsor: {sponsor}")
-        print(f"Summary: {summary}")
-        print(f"Link: {link}")
-        print()  # Empty line for readability
-        
-        # Build the formatted text for posting
-        text = self.build_x_post_text(bill_number, date_introduced, sponsor, summary, link)
-        
-        # Print what would be posted
-        print(f"Formatted text for X.com:")
-        print(text)
-        print()
-        
-        # TESTING MODE: Comment out actual posting
-        # Uncomment the code below to enable actual posting to X.com
-        """
+    def post_bill(self, docnum: str, title: str, link: str) -> bool:
+        text = self.build_tweet_text(docnum, title, link)
         if not self.client:
-            LOG.warning("DRY-RUN: Would post to X: %s", text)
-            return False
-        
-        try:
-            LOG.info("Posting to X: %s", text)
-            resp = self.client.create_tweet(text=text)
-            tweet_id = getattr(resp, "data", {}).get("id") if hasattr(resp, "data") else None
-            if tweet_id:
-                LOG.info("Successfully posted to X! Tweet ID: %s", tweet_id)
-                print(f"Post to X successful! X ID: {tweet_id}")
-            else:
-                LOG.info("Posted to X (response: %s)", resp)
-                print("Post to X successful!")
+            LOG.info("DRY-RUN: %s", text)
             return True
-        except Exception as e:
+        try:
+            resp = self.client.create_tweet(text=text)
+            LOG.info("Posted tweet id=%s", getattr(resp, "data", {}).get("id"))
+            return True
+        except Exception:
             LOG.exception("Failed to post to X")
-            print(f"Post to X failed: {e}")
             return False
-        """
-        
-        # Return True for testing purposes (simulating successful post)
-        LOG.info("TEST MODE: Posting disabled. Would have posted to X.")
-        return True
 
     @staticmethod
-    def build_x_post_text(bill_number: str, date_introduced: str, sponsor: str, summary: str, link: str) -> str:
-        """
-        Build formatted post text with all bill information.
-        Format: Bill Number, Date Introduced, Sponsor, Summary, Link
-        """
-        # Build the text with all information
-        text = f"Bill Number: {bill_number}\n"
-        text += f"Date Introduced: {date_introduced}\n"
-        text += f"Sponsor: {sponsor}\n"
-        text += f"Summary: {summary}\n"
-        text += f"Link: {link}"
-        
-        # X character limit is 280, but we need to handle longer content
-        if len(text) > 280:
-            # Calculate available space for summary (most likely to be long)
-            base_text = f"Bill Number: {bill_number}\nDate Introduced: {date_introduced}\nSponsor: {sponsor}\nSummary: \nLink: {link}"
-            base_length = len(base_text)
-            available_for_summary = 280 - base_length - 10  # Leave some buffer
-            
-            if available_for_summary > 20:  # Only truncate if we have reasonable space
-                summary_truncated = summary[:available_for_summary - 3] + "..."
-                text = f"Bill Number: {bill_number}\nDate Introduced: {date_introduced}\nSponsor: {sponsor}\nSummary: {summary_truncated}\nLink: {link}"
-            else:
-                # If still too long, truncate more aggressively
-                # Keep bill number, date, sponsor, and link, truncate summary heavily
-                max_summary = 280 - base_length + len(summary) - 20
-                if max_summary > 10:
-                    summary_truncated = summary[:max_summary - 3] + "..."
-                    text = f"Bill Number: {bill_number}\nDate Introduced: {date_introduced}\nSponsor: {sponsor}\nSummary: {summary_truncated}\nLink: {link}"
-                else:
-                    # Last resort: truncate everything
-                    text = text[:277] + "..."
-        
+    def build_tweet_text(docnum: Optional[str], title: str, link: str) -> str:
+        if docnum:
+            text = f"New legislation posted: {docnum} — {link}"
+        else:
+            text = f"New legislation posted: {title} — {link}"
+        if len(text) > 270:
+            text = text[:266] + "..."
         return text
