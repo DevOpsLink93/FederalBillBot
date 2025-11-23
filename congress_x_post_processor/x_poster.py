@@ -68,3 +68,5 @@ class XPoster:
         if len(text) > 270:
             text = text[:266] + "..."
         return text
+
+

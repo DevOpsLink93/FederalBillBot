@@ -15,3 +15,4 @@ FederalBillBot is an automated bot that scans Congress.gov for new congressional
 
 - The `api/` and 'sqlite' folder is ignored by git based upon the security of local credentials
 - The Script is currently in dev posting to X, all post until this read me are current post test. 
+
