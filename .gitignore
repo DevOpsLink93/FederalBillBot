@@ -1,6 +1,14 @@
 # Ignore local API credentials and other local-only API modules
 api/
 
+#Ignore sqlite database files
+*.sqlite
+*.db
+sqlite/
+
+#ignore internal Test files no relevancy to the project
+internal_test_ignore/
+
 # Local database 
 sqlite/
 
@@ -12,3 +20,6 @@ Internal_Test_Ignore/
 .vs/VSWorkspaceState.json
 .vs/FederalBillBot/v17/.wsuo
 .vs/ProjectSettings.json
+
+
+
