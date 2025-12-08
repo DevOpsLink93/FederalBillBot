@@ -219,6 +219,8 @@ def process_new_bills(api_key: str, processed_bills: Set[str], poster: XPoster) 
     if not bills:
         return 0
 
+    batch_new_count = 0  # Initialize counter for new bills processed
+
     # Process these 5 bills for possible DB insert / X posting
     for bill in bills:
         bill_type = bill.get("type", "").upper()
