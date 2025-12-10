@@ -279,13 +279,14 @@ def process_new_bills(api_key: str, processed_bills: Set[str], poster: XPoster) 
 
 
 def countdown_timer(seconds: int) -> None:
-	"""Display a countdown timer with minutes and seconds remaining."""
+	"""Display a countdown timer with hours, minutes and seconds remaining."""
 	for remaining in range(seconds, 0, -1):
-		mins, secs = divmod(remaining, 60)
-		timer_display = f"\rNext scan in {mins:02d}:{secs:02d}"
+		hours, remainder = divmod(remaining, 3600)
+		mins, secs = divmod(remainder, 60)
+		timer_display = f"\rNext scan in {hours:02d}:{mins:02d}:{secs:02d}"
 		print(timer_display, end='', flush=True)
 		time.sleep(1)
-	print("\r" + " " * 25 + "\r", end='', flush=True)  # Clear the timer line
+	print("\r" + " " * 35 + "\r", end='', flush=True)  # Clear the timer line (increased space for longer display)
 
 
 def perform_bulk_load(api_key: str, poster: XPoster) -> None:
@@ -428,11 +429,11 @@ def main() -> int:
 	# Track processed bills to avoid duplicates in this session
 	processed_bills: Set[str] = set()
 
-	# Monitoring interval: 15 minutes = 900 seconds
-	interval = 15 * 60
+	# Monitoring interval: 1 hour = 3600 seconds
+	interval = 60 * 60
 
 	print("🔄 Starting continuous monitoring for newly introduced legislation")
-	print("Checking congress.gov API every 15 minutes")
+	print("Checking congress.gov API every hour")
 	print("Press Ctrl+C to stop")
 	print()
 
@@ -447,12 +448,12 @@ def main() -> int:
 				else:
 					print("🔍 Scan complete - no new legislation found")
 
-				print("Will recheck in 15 minutes...")
+				print("Will recheck in 1 hour...")
 				countdown_timer(interval)
 
 			except Exception as e:
 				print(f"❌ Monitoring error: {e}")
-				print("Will retry in 15 minutes...")
+				print("Will retry in 1 hour...")
 				countdown_timer(interval)
 
 	except KeyboardInterrupt:

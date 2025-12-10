@@ -1,7 +1,7 @@
 
 # FederalBillBot
 
-FederalBillBot is an automated bot that scans Congress.gov for new congressional legislation and logs each new bill every 15 minutes. Currently just scans for a new legislation that has been introduced. 
+FederalBillBot is an automated bot that scans Congress.gov for new congressional legislation and logs each new bill every hour. Currently just scans for a new legislation that has been introduced. 
 
 ## How it works
 
