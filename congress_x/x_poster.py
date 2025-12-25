@@ -273,6 +273,7 @@ class XPoster:
         """
         Create multiple PNG images from bills data, with max 15 bills per image.
         Generates up to 4 images maximum. Final image contains remaining bills with no limit.
+        Deduplicates bills before processing to prevent duplicates in images.
 
         Args:
             bills_data: List of all bill data dictionaries
@@ -284,6 +285,23 @@ class XPoster:
         if not bills_data:
             LOG.info("No bills to create images for")
             return []
+        
+        # Deduplicate bills by formatted_bill_number to prevent duplicates in images
+        seen_bills = {}
+        deduplicated_bills = []
+        for bill in bills_data:
+            bill_id = bill.get('formatted_bill_number', '')
+            if bill_id and bill_id not in seen_bills:
+                seen_bills[bill_id] = True
+                deduplicated_bills.append(bill)
+            elif not bill_id:
+                # If no formatted_bill_number, include it (shouldn't happen but be safe)
+                deduplicated_bills.append(bill)
+        
+        if len(deduplicated_bills) < len(bills_data):
+            LOG.warning(f"Deduplicated bills: {len(bills_data)} -> {len(deduplicated_bills)} (removed {len(bills_data) - len(deduplicated_bills)} duplicates)")
+        
+        bills_data = deduplicated_bills
 
         image_paths = []
         total_bills = len(bills_data)
@@ -649,6 +667,7 @@ class XPoster:
     def process_bills_into_posts(self, bills_data: list, post_to_x: bool = False, create_png: bool = False, png_filename: str = "federal_bills_summary.png") -> tuple[int, bool]:
         """
         Process multiple bills and create ONE tweet with all bills and images attached.
+        Deduplicates bills before processing to prevent duplicate entries in images and posts.
 
         Args:
             bills_data: List of bill data dictionaries
@@ -660,6 +679,23 @@ class XPoster:
             Tuple of (number of bills processed, whether X posting was successful)
         """
         try:
+            # Deduplicate bills by formatted_bill_number to prevent duplicates in posts and images
+            seen_bills = {}
+            deduplicated_bills = []
+            for bill in bills_data:
+                bill_id = bill.get('formatted_bill_number', '')
+                if bill_id and bill_id not in seen_bills:
+                    seen_bills[bill_id] = True
+                    deduplicated_bills.append(bill)
+                elif not bill_id:
+                    # If no formatted_bill_number, include it (shouldn't happen but be safe)
+                    deduplicated_bills.append(bill)
+            
+            if len(deduplicated_bills) < len(bills_data):
+                LOG.warning(f"Deduplicated bills: {len(bills_data)} -> {len(deduplicated_bills)} (removed {len(bills_data) - len(deduplicated_bills)} duplicates)")
+            
+            bills_data = deduplicated_bills
+            
             LOG.info(f"Processing {len(bills_data)} bills - posting as ONE tweet with images")
 
             # Format all bills
