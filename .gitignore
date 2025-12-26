@@ -1,6 +1,9 @@
 # Ignore local API credentials and other local-only API modules
 api/
 
+#Ignore archive files
+archive/
+
 #Ignore sqlite database files
 *.sqlite
 *.db
