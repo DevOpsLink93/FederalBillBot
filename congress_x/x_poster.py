@@ -8,12 +8,12 @@ from typing import Dict, Any, Optional
 
 # Import database functions
 try:
-    from ..sqlite.new_Legislation_log import log_bill_from_data
+    from ..sqlite.new_Legislation_log import log_bill_from_data, bill_exists, init_db_connection
 except ImportError:
     from pathlib import Path
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from sqlite.new_Legislation_log import log_bill_from_data
+    from sqlite.new_Legislation_log import log_bill_from_data, bill_exists, init_db_connection
 
 LOG = logging.getLogger("x_poster")
 
@@ -89,19 +89,41 @@ class XPoster:
             LOG.error(f"Failed to write to {self.output_file}: {e}")
             raise
 
-    def store_in_database(self, bill_data: Dict[str, Any]) -> None:
+    def store_in_database(self, bill_data: Dict[str, Any]) -> bool:
         """
         Store bill data in the database using new_Legislation_log.py
+        First checks if bill already exists to prevent duplicates.
 
         Args:
             bill_data: Bill data dictionary
+            
+        Returns:
+            True if bill was stored, False if it already existed
         """
         try:
+            # Extract bill info
+            bill_number = bill_data.get('bill_number', '')
+            bill_type = bill_data.get('bill_type', '')
+            congress = bill_data.get('congress', '')
+            formatted_number = bill_data.get('formatted_bill_number', f"{bill_type}.{bill_number}")
+            
+            # Check if bill already exists in database
+            try:
+                conn = init_db_connection()
+                if bill_exists(conn, congress, bill_number, bill_type):
+                    LOG.warning(f"⚠️  Bill {formatted_number} already exists in database - skipping to prevent duplicate posting")
+                    conn.close()
+                    return False
+                conn.close()
+            except Exception as e:
+                LOG.error(f"❌ Database validation check failed for {formatted_number}: {e}")
+                raise
+            
             # Prepare data for database logging
             db_data = {
-                'bill_number': bill_data.get('bill_number', ''),
-                'bill_type': bill_data.get('bill_type', ''),
-                'congress': bill_data.get('congress', ''),
+                'bill_number': bill_number,
+                'bill_type': bill_type,
+                'congress': congress,
                 'title': bill_data.get('title', 'Unknown'),
                 'summary': bill_data.get('summary', 'Unknown'),
                 'sponsor': bill_data.get('sponsor', 'Unknown'),
@@ -111,7 +133,8 @@ class XPoster:
             }
 
             log_bill_from_data(db_data)
-            LOG.info(f"Successfully stored bill {bill_data.get('formatted_bill_number')} in database")
+            LOG.info(f"✅ Successfully stored bill {formatted_number} in database")
+            return True
 
         except Exception as e:
             LOG.error(f"Failed to store bill in database: {e}")
@@ -481,7 +504,9 @@ class XPoster:
             # Store all bills in database
             for bill_data, _ in formatted_bills:
                 try:
-                    self.store_in_database(bill_data)
+                    was_stored = self.store_in_database(bill_data)
+                    if not was_stored:
+                        LOG.debug(f"Bill {bill_data.get('formatted_bill_number')} already existed in database")
                 except Exception as e:
                     LOG.error(f"Failed to store bill {bill_data.get('formatted_bill_number', 'Unknown')} in database: {e}")
 
@@ -792,8 +817,9 @@ class XPoster:
             bills_saved = 0
             for bill_data, _ in formatted_bills:
                 try:
-                    self.store_in_database(bill_data)
-                    bills_saved += 1
+                    was_stored = self.store_in_database(bill_data)
+                    if was_stored:
+                        bills_saved += 1
                 except Exception as e:
                     LOG.error(f"Failed to store bill {bill_data.get('formatted_bill_number', 'Unknown')} in database: {e}")
 

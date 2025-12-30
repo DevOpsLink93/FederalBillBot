@@ -32,6 +32,14 @@ try:
 except ImportError:
     from x_poster import XPoster
 
+# Import Proton Docs integration
+try:
+    from ..api.proton_docs_api import create_bill_document
+except ImportError:
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from api.proton_docs_api import create_bill_document
+
 LOG = logging.getLogger("congress_monitor")
 
 
@@ -294,6 +302,18 @@ def monitor_and_process_bills(api_key: str, limit: int = 50, post_to_x: bool = F
         bill_detail = get_bill_details(api_key, congress, bill_type, bill_number)
         bill_data = extract_bill_data(bill, bill_detail)
         bills_to_process.append(bill_data)
+        
+        # Create Proton Docs document for this bill
+        try:
+            api_key_path = os.path.join(os.path.dirname(__file__), "..", "api", "proton_api_key.txt")
+            api_url_path = os.path.join(os.path.dirname(__file__), "..", "api", "proton_api_url.txt")
+            doc_result = create_bill_document(bill_data, api_key_path, api_url_path)
+            if doc_result and doc_result.get('success'):
+                LOG.info(f"📄 Created Proton Doc for {bill_type}.{bill_number}: {doc_result.get('document_id')}")
+            elif doc_result is None:
+                LOG.debug(f"Proton Docs integration not configured for {bill_type}.{bill_number} (optional feature)")
+        except Exception as e:
+            LOG.debug(f"Proton Docs creation skipped for {bill_type}.{bill_number}: {e}")
 
     # Process bills into posts and store in database
     if bills_to_process:
