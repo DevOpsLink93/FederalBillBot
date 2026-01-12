@@ -292,10 +292,12 @@ class XPoster:
             LOG.error(f"Failed to create PNG image: {e}")
             return ""
 
-    def create_multiple_bills_pngs(self, bills_data: list, base_filename: str = "federal_bills_summary.png") -> list:
+    def create_multiple_bills_pngs(self, bills_data: list, base_filename: str = "federal_bills_summary.png") -> tuple[list, list]:
         """
-        Create multiple PNG images from bills data, with max 15 bills per image.
-        Generates up to 4 images maximum. Final image contains remaining bills with no limit.
+        Create multiple PNG images from bills data with threading support.
+        Main thread: up to 4 images with max 15 bills per image (60 bills max).
+        If more bills exist, create a reply thread with up to 4 more images.
+        Final image in reply thread aggregates all remaining bills.
         Deduplicates bills before processing to prevent duplicates in images.
 
         Args:
@@ -303,11 +305,11 @@ class XPoster:
             base_filename: Base filename for PNG images (will add _1, _2, etc.)
 
         Returns:
-            List of created image file paths
+            Tuple of (main_thread_images, reply_thread_images) lists
         """
         if not bills_data:
             LOG.info("No bills to create images for")
-            return []
+            return [], []
         
         # Deduplicate bills by formatted_bill_number to prevent duplicates in images
         seen_bills = {}
@@ -326,19 +328,63 @@ class XPoster:
         
         bills_data = deduplicated_bills
 
+        main_thread_images = []
+        reply_thread_images = []
+        total_bills = len(bills_data)
+        max_images_per_thread = 4
+        bills_per_image = 15
+        max_bills_main_thread = max_images_per_thread * bills_per_image  # 60 bills
+
+        # Split bills into main thread and reply thread
+        main_bills = bills_data[:max_bills_main_thread]
+        reply_bills = bills_data[max_bills_main_thread:]
+
+        # Create main thread images
+        LOG.info(f"Creating main thread: {len(main_bills)} bills")
+        main_thread_images = self._create_image_set(main_bills, base_filename, is_reply=False)
+
+        # Create reply thread images if there are remaining bills
+        if reply_bills:
+            LOG.info(f"Creating reply thread: {len(reply_bills)} bills (exceeds 60 bill main thread limit)")
+            # Create alternate filename for reply thread
+            name_parts = base_filename.rsplit('.', 1)
+            reply_filename = f"{name_parts[0]}_reply.{name_parts[1]}" if len(name_parts) > 1 else f"{base_filename}_reply"
+            reply_thread_images = self._create_image_set(reply_bills, reply_filename, is_reply=True)
+
+        total_images = len(main_thread_images) + len(reply_thread_images)
+        LOG.info(f"Successfully created {total_images} PNG image(s) - Main thread: {len(main_thread_images)}, Reply thread: {len(reply_thread_images)}")
+        return main_thread_images, reply_thread_images
+
+    def _create_image_set(self, bills_data: list, base_filename: str, is_reply: bool = False) -> list:
+        """
+        Helper method to create a set of images (either main thread or reply thread).
+        Creates up to 4 images with 15 bills each, final image aggregates remaining bills.
+
+        Args:
+            bills_data: List of bill data dictionaries for this image set
+            base_filename: Base filename for PNG images
+            is_reply: Whether this is a reply thread (affects logging)
+
+        Returns:
+            List of created image file paths
+        """
         image_paths = []
         total_bills = len(bills_data)
         max_images = 4
         bills_per_image = 15
 
-        # Calculate how many images are needed
+        if total_bills == 0:
+            return image_paths
+
+        # Calculate how many images are needed for this set
         if total_bills <= bills_per_image:
             num_images = 1
         else:
             # Calculate images needed: up to 4, with 15 bills each except the last
             num_images = min((total_bills + bills_per_image - 1) // bills_per_image, max_images)
 
-        LOG.info(f"Creating {num_images} PNG image(s) from {total_bills} bills")
+        thread_type = "reply" if is_reply else "main"
+        LOG.info(f"Creating {num_images} PNG image(s) in {thread_type} thread from {total_bills} bills")
 
         # Create images
         for image_num in range(1, num_images + 1):
@@ -370,11 +416,11 @@ class XPoster:
             
             if image_path:
                 image_paths.append(image_path)
-                LOG.info(f"Image {image_num}/{num_images}: {len(bills_chunk)} bills")
+                final_indicator = " (final - aggregated)" if (image_num == num_images and len(bills_chunk) > bills_per_image) else ""
+                LOG.info(f"{thread_type.upper()} Image {image_num}/{num_images}: {len(bills_chunk)} bills{final_indicator}")
             else:
-                LOG.error(f"Failed to create image {image_num}/{num_images}")
+                LOG.error(f"Failed to create {thread_type} image {image_num}/{num_images}")
 
-        LOG.info(f"Successfully created {len(image_paths)} PNG image(s)")
         return image_paths
 
     def archive_images(self, image_paths: list) -> bool:
@@ -546,18 +592,20 @@ class XPoster:
             LOG.error(f"Failed to process bill {bill_data.get('formatted_bill_number', 'Unknown')}: {e}")
             return False
 
-    def post_posts_to_x(self, posts: list, image_paths: list = None, total_bills: int = 0) -> int:
+    def post_posts_to_x(self, posts: list, image_paths: list = None, total_bills: int = 0, reply_to_tweet_id: str = None) -> tuple[int, str]:
         """
         Post multiple posts to X.com using the same format as the .txt file.
+        Supports both standalone posts and replies to existing tweets.
         Distributes images across posts in round-robin fashion (up to 4 images max).
 
         Args:
             posts: List of post text strings (same format as written to .txt file)
             image_paths: Optional list of image file paths to attach to posts
             total_bills: Total number of bills discovered (for tweet text)
+            reply_to_tweet_id: Optional tweet ID to reply to (creates reply thread)
 
         Returns:
-            Number of posts successfully posted
+            Tuple of (number of posts successfully posted, tweet_id of first/main post)
         """
         # Handle backward compatibility - convert single string to list
         if isinstance(image_paths, str):
@@ -577,6 +625,7 @@ class XPoster:
             sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
             from api.x_api_call import get_x_api_client, get_x_api
 
+        try:
             client = get_x_api_client()
             api = get_x_api()
 
@@ -619,6 +668,7 @@ class XPoster:
                     continue
 
             posted_count = 0
+            first_tweet_id = None
 
             for post_idx, post_text in enumerate(posts):
                 try:
@@ -642,7 +692,8 @@ class XPoster:
                     if len(tweet_text) > 280:
                         tweet_text = tweet_text[:277] + "..."
 
-                    LOG.info(f"Posting to X: {tweet_text[:100]}...")
+                    reply_indicator = " (reply)" if reply_to_tweet_id else ""
+                    LOG.info(f"Posting to X{reply_indicator}: {tweet_text[:100]}...")
 
                     # Distribute images in round-robin fashion across posts
                     media_ids = []
@@ -656,15 +707,24 @@ class XPoster:
                     # Post to X with optional media
                     if media_ids and len(media_ids) > 0:
                         LOG.info(f"Creating tweet with {len(media_ids)} media attachment(s): {media_ids}")
-                        response = client.create_tweet(text=tweet_text, media_ids=media_ids)
+                        if reply_to_tweet_id:
+                            response = client.create_tweet(text=tweet_text, media_ids=media_ids, reply_settings="everyone", in_reply_to_tweet_id=reply_to_tweet_id)
+                        else:
+                            response = client.create_tweet(text=tweet_text, media_ids=media_ids)
                         LOG.info("Posted to X with image attachment")
                     else:
                         LOG.info("Creating tweet without media attachment")
-                        response = client.create_tweet(text=tweet_text)
+                        if reply_to_tweet_id:
+                            response = client.create_tweet(text=tweet_text, reply_settings="everyone", in_reply_to_tweet_id=reply_to_tweet_id)
+                        else:
+                            response = client.create_tweet(text=tweet_text)
+                    
                     tweet_id = getattr(response, "data", {}).get("id") if hasattr(response, "data") else None
 
                     if tweet_id:
                         LOG.info(f"Successfully posted to X.com, Tweet ID: {tweet_id}")
+                        if first_tweet_id is None:
+                            first_tweet_id = tweet_id
                         posted_count += 1
 
                         # Rate limiting: wait between posts
@@ -680,18 +740,19 @@ class XPoster:
                     continue
 
             LOG.info(f"Successfully posted {posted_count} out of {len(posts)} posts to X.com")
-            return posted_count if posted_count > 0 else 0
+            return posted_count if posted_count > 0 else 0, first_tweet_id
 
         except ImportError:
             LOG.warning("X API client not available - check api/x_api_call.py and credentials")
-            return 0
+            return 0, None
         except Exception as e:
             LOG.error(f"Failed to initialize X posting: {e}")
-            return 0  # Always return integer, never None
+            return 0, None
 
     def process_bills_into_posts(self, bills_data: list, post_to_x: bool = False, create_png: bool = False, png_filename: str = "federal_bills_summary.png") -> tuple[int, bool]:
         """
         Process multiple bills and create ONE tweet with all bills and images attached.
+        Supports threaded posting: main thread (up to 4 images, 60 bills max) + optional reply thread.
         Deduplicates bills before processing to prevent duplicate entries in images and posts.
 
         Args:
@@ -721,7 +782,7 @@ class XPoster:
             
             bills_data = deduplicated_bills
             
-            LOG.info(f"Processing {len(bills_data)} bills - posting as ONE tweet with images")
+            LOG.info(f"Processing {len(bills_data)} bills - posting as ONE tweet with images (threading support enabled)")
 
             # Format all bills
             formatted_bills = []
@@ -735,19 +796,22 @@ class XPoster:
             # Write to .txt file
             self.append_to_txt_file(post_text, add_new_post_indicator=False)
 
-            # Create PNG images if requested
-            image_paths = []
+            # Create PNG images if requested (with threading support)
+            main_thread_images = []
+            reply_thread_images = []
             if create_png and bills_data:
-                LOG.info("Creating PNG image(s) with bills...")
-                image_paths = self.create_multiple_bills_pngs(bills_data, png_filename)
+                LOG.info("Creating PNG image(s) with bills (threading-aware)...")
+                main_thread_images, reply_thread_images = self.create_multiple_bills_pngs(bills_data, png_filename)
                 
-                if image_paths:
-                    LOG.info(f"Successfully created {len(image_paths)} PNG image(s)")
+                total_images = len(main_thread_images) + len(reply_thread_images)
+                if total_images > 0:
+                    LOG.info(f"Successfully created {total_images} PNG image(s) - Main: {len(main_thread_images)}, Reply: {len(reply_thread_images)}")
                 else:
                     LOG.error("Failed to create PNG images")
 
-            # Post to X.com as ONE tweet with all images
+            # Post to X.com with threading support
             posted_count = 0
+            posting_successful = False
             if post_to_x:
                 try:
                     from ..api.x_api_call import get_x_api_client, get_x_api
@@ -760,57 +824,109 @@ class XPoster:
                     client = get_x_api_client()  # v2 API Client for posting
                     api = get_x_api()  # v1.1 API for media uploads (has limited access)
                     
-                    # Upload all images and collect media IDs using v1.1 API
-                    media_ids = []
-                    for image_path in image_paths:
+                    # Post main thread
+                    if main_thread_images:
+                        # Upload main thread images and collect media IDs using v1.1 API
+                        media_ids = []
+                        for image_path in main_thread_images:
+                            try:
+                                LOG.info(f"Uploading main thread image: {image_path}")
+                                media = api.media_upload(image_path)
+                                media_ids.append(str(media.media_id))  # Convert to string for v2 API
+                                LOG.info(f"✅ Uploaded main thread image - Media ID: {media.media_id}")
+                            except Exception as e:
+                                LOG.warning(f"Failed to upload image {image_path}: {e}")
+                        
+                        # Post main thread tweet
                         try:
-                            LOG.info(f"Uploading image: {image_path}")
-                            # Use Tweepy API v1.1 method for media uploads
-                            media = api.media_upload(image_path)
-                            media_ids.append(str(media.media_id))  # Convert to string for v2 API
-                            LOG.info(f"✅ Uploaded image - Media ID: {media.media_id}")
+                            # Generate timestamp in EST
+                            est_tz = timezone(timedelta(hours=-5))  # EST is UTC-5
+                            est_time = datetime.now(est_tz)
+                            date_str = est_time.strftime('%Y-%m-%d')
+                            time_str = est_time.strftime('%I:%M %p')
+                            
+                            # Create proper tweet text summary
+                            bill_count = len(bills_data)
+                            tweet_text = f"Introduced Legislation Detected {date_str} - {time_str}. {bill_count} bills discovered. See images for details or visit congress.gov."
+                            
+                            # Ensure tweet is within 280 character limit
+                            if len(tweet_text) > 280:
+                                tweet_text = tweet_text[:277] + "..."
+                            
+                            if media_ids:
+                                # Create tweet with media IDs using v2 API
+                                response = client.create_tweet(text=tweet_text, media_ids=media_ids)
+                                main_tweet_id = response.data['id']
+                                LOG.info(f"✅ Posted main thread with {len(media_ids)} images to X.com - Tweet ID: {main_tweet_id}")
+                                posted_count += 1
+                                posting_successful = True
+                            else:
+                                # Create tweet without media using v2 API
+                                response = client.create_tweet(text=tweet_text)
+                                main_tweet_id = response.data['id']
+                                LOG.info(f"✅ Posted main thread (no images) to X.com - Tweet ID: {main_tweet_id}")
+                                posted_count += 1
+                                posting_successful = True
+                            
+                            # Post reply thread if it exists
+                            if reply_thread_images:
+                                LOG.info(f"🔗 Starting reply thread with {len(reply_thread_images)} images")
+                                import time
+                                time.sleep(2)  # Brief delay before reply
+                                
+                                # Upload reply thread images
+                                reply_media_ids = []
+                                for image_path in reply_thread_images:
+                                    try:
+                                        LOG.info(f"Uploading reply thread image: {image_path}")
+                                        media = api.media_upload(image_path)
+                                        reply_media_ids.append(str(media.media_id))
+                                        LOG.info(f"✅ Uploaded reply thread image - Media ID: {media.media_id}")
+                                    except Exception as e:
+                                        LOG.warning(f"Failed to upload reply image {image_path}: {e}")
+                                
+                                # Post reply tweets
+                                if reply_media_ids:
+                                    reply_tweet_text = f"Continued thread with additional bills from this session."
+                                    if len(reply_tweet_text) > 280:
+                                        reply_tweet_text = reply_tweet_text[:277] + "..."
+                                    
+                                    response = client.create_tweet(text=reply_tweet_text, media_ids=reply_media_ids, in_reply_to_tweet_id=main_tweet_id)
+                                    reply_tweet_id = response.data['id']
+                                    LOG.info(f"✅ Posted reply thread with {len(reply_media_ids)} images - Tweet ID: {reply_tweet_id}")
+                                    posted_count += 1
                         except Exception as e:
-                            LOG.warning(f"Failed to upload image {image_path}: {e}")
-                    
-                    # Post single tweet with all images using v2 API (has broader endpoint access)
-                    try:
-                        # Generate timestamp in EST
-                        est_tz = timezone(timedelta(hours=-5))  # EST is UTC-5
-                        est_time = datetime.now(est_tz)
-                        date_str = est_time.strftime('%Y-%m-%d')
-                        time_str = est_time.strftime('%I:%M %p')
-                        
-                        # Create proper tweet text summary (NOT the raw bill list)
-                        bill_count = len(bills_data)
-                        tweet_text = f"Introduced Legislation Detected {date_str} - {time_str}. {bill_count} bills discovered. See images for details or visit congress.gov."
-                        
-                        # Ensure tweet is within 280 character limit
-                        if len(tweet_text) > 280:
-                            tweet_text = tweet_text[:277] + "..."
-                        
-                        if media_ids:
-                            # Create tweet with media IDs using v2 API (broader access)
-                            response = client.create_tweet(text=tweet_text, media_ids=media_ids)
-                            tweet_id = response.data['id']
-                            LOG.info(f"✅ Posted tweet with {len(media_ids)} images to X.com - Tweet ID: {tweet_id}")
-                            posted_count = 1
-                        else:
-                            # Create tweet without media using v2 API
+                            LOG.error(f"Failed to post main thread tweet: {e}")
+                            posting_successful = False
+                    else:
+                        # No images, post text only
+                        try:
+                            est_tz = timezone(timedelta(hours=-5))
+                            est_time = datetime.now(est_tz)
+                            date_str = est_time.strftime('%Y-%m-%d')
+                            time_str = est_time.strftime('%I:%M %p')
+                            
+                            bill_count = len(bills_data)
+                            tweet_text = f"Introduced Legislation Detected {date_str} - {time_str}. {bill_count} bills discovered. Visit congress.gov for details."
+                            
+                            if len(tweet_text) > 280:
+                                tweet_text = tweet_text[:277] + "..."
+                            
                             response = client.create_tweet(text=tweet_text)
-                            tweet_id = response.data['id']
-                            LOG.info(f"✅ Posted tweet (no images) to X.com - Tweet ID: {tweet_id}")
-                            posted_count = 1
-                        
-                    except Exception as e:
-                        LOG.error(f"Failed to post tweet: {e}")
-                        posted_count = 0
+                            main_tweet_id = response.data['id']
+                            LOG.info(f"✅ Posted tweet (no images) to X.com - Tweet ID: {main_tweet_id}")
+                            posted_count += 1
+                            posting_successful = True
+                        except Exception as e:
+                            LOG.error(f"Failed to post text-only tweet: {e}")
+                            posting_successful = False
                         
                 except Exception as e:
                     LOG.error(f"Failed to initialize X API client: {e}")
-                    posted_count = 0
+                    posting_successful = False
             else:
                 LOG.info("X posting disabled - bills written to .txt file only")
-                posted_count = 0
+                posting_successful = False
 
             # Store all bills in database
             LOG.info("Saving bills to database...")
@@ -825,21 +941,21 @@ class XPoster:
 
             LOG.info(f"Successfully saved {bills_saved} out of {len(formatted_bills)} bills to database")
 
-            # Return result tuple
-            posting_successful = posted_count > 0 if post_to_x else False
-            
             # Archive images after successful X posting
-            if posting_successful and image_paths:
-                LOG.info("🔄 Archiving images after successful X posting...")
-                archive_success = self.archive_images(image_paths)
-                if archive_success:
-                    LOG.info("✅ Images successfully archived")
-                else:
-                    LOG.warning("⚠️  Some images may not have been archived")
-            elif image_paths and not post_to_x:
+            if posting_successful:
+                all_images = main_thread_images + reply_thread_images
+                if all_images:
+                    LOG.info("🔄 Archiving images after successful X posting...")
+                    archive_success = self.archive_images(all_images)
+                    if archive_success:
+                        LOG.info("✅ Images successfully archived")
+                    else:
+                        LOG.warning("⚠️  Some images may not have been archived")
+            elif (main_thread_images or reply_thread_images) and not post_to_x:
                 LOG.info("Images not archived (X posting disabled)")
             
-            LOG.info(f"Processing complete - {len(bills_data)} bills in ONE tweet, {len(image_paths)} images. X posting success: {posting_successful}")
+            total_images = len(main_thread_images) + len(reply_thread_images)
+            LOG.info(f"Processing complete - {len(bills_data)} bills, {total_images} images (main: {len(main_thread_images)}, reply: {len(reply_thread_images)}). X posting success: {posting_successful}")
             return len(bills_data), posting_successful
 
         except Exception as e:
