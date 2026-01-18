@@ -48,7 +48,7 @@ class XPoster:
 
     def format_bill_text(self, bill_data: Dict[str, Any], include_url: bool = True) -> str:
         """
-        Format bill data as [Bill_Number](URL) - Title of Bill or Bill_Number - Title of Bill.
+        Format bill data as [Bill Number] followed by Title: [Title].
         No truncation - full bill text for post creation.
 
         Args:
@@ -62,11 +62,11 @@ class XPoster:
         title = bill_data.get('title', '')
         url = bill_data.get('url', '')
 
-        # Create the basic format with or without URL
+        # Create the new format: [Bill Number] \n Title: [Title]
         if include_url and url and url != 'Unknown':
-            bill_text = f"[{bill_number}]({url}) - {title}"
+            bill_text = f"[{bill_number}]({url})\nTitle: {title}"
         else:
-            bill_text = f"{bill_number} - {title}"
+            bill_text = f"{bill_number}\nTitle: {title}"
 
         return bill_text
 
@@ -170,13 +170,14 @@ class XPoster:
                 return False
 
         try:
-            # Image settings
+            # Image settings - 16:9 aspect ratio (1200x675)
             width = 1200
-            padding = 40
-            line_height = 25
+            height = 675
+            padding = 30
+            line_height = 22
             title_font_size = 24
-            bill_font_size = 16
-            header_spacing = 60
+            bill_font_size = 22
+            header_spacing = 50
 
             # Create title
             est_tz = timezone(timedelta(hours=-5))  # EST is UTC-5
@@ -226,13 +227,27 @@ class XPoster:
                 # Add height for this bill's lines plus separator
                 total_bill_height += len(lines) * line_height + line_height  # +line_height for separator
 
-            # Calculate image height based on actual wrapped content
+            # Use fixed height (16:9 aspect ratio) and scale content if needed
+            # If content exceeds fixed height, shrink font sizes proportionally
             title_height = header_spacing
-            extra_bottom_padding = line_height * 2
-            total_height = title_height + total_bill_height + (padding * 2) + extra_bottom_padding
+            extra_bottom_padding = line_height
+            available_height = height - title_height - (padding * 2) - extra_bottom_padding
+            
+            if total_bill_height > available_height:
+                # Scale factor to fit content in fixed height
+                scale_factor = available_height / total_bill_height
+                line_height = int(line_height * scale_factor)
+                bill_font_size = max(14, int(bill_font_size * scale_factor))
+                
+                try:
+                    bill_font = ImageFont.truetype("arial.ttf", bill_font_size)
+                except OSError:
+                    bill_font = ImageFont.load_default()
+                
+                LOG.info(f"Content exceeds fixed height - scaled down to {bill_font_size}pt font and {line_height}px line height")
 
-            # Create image
-            image = Image.new('RGB', (width, total_height), color='white')
+            # Create image with fixed 16:9 dimensions
+            image = Image.new('RGB', (width, height), color='white')
             draw = ImageDraw.Draw(image)
 
             # Draw title
@@ -241,9 +256,14 @@ class XPoster:
             title_x = (width - title_width) // 2
             draw.text((title_x, padding), title, fill='black', font=title_font)
 
-            # Draw bills
+            # Draw bills with content clipping to fixed height
             y_position = padding + header_spacing
             for i, bill_text in enumerate(formatted_bills):
+                # Stop drawing if we've reached the bottom of the image
+                if y_position >= height - padding:
+                    LOG.info(f"Reached image height limit - {i}/{len(formatted_bills)} bills displayed")
+                    break
+                    
                 # Handle long lines by wrapping them
                 max_line_width = width - (padding * 2)
                 words = bill_text.split()
@@ -267,6 +287,11 @@ class XPoster:
 
                 # Draw each line centered
                 for line in lines:
+                    # Check if line fits in remaining space
+                    if y_position + line_height > height - padding:
+                        LOG.info(f"Insufficient space for remaining bills in 16:9 format")
+                        break
+                        
                     bbox = draw.textbbox((0, 0), line, font=bill_font)
                     line_width = bbox[2] - bbox[0]
                     line_x = (width - line_width) // 2
@@ -274,7 +299,7 @@ class XPoster:
                     y_position += line_height
 
                 # Add horizontal separator line after each bill (except the last one)
-                if i < len(formatted_bills) - 1:
+                if i < len(formatted_bills) - 1 and y_position < height - padding:
                     y_position += line_height // 2  # Add some space before the line
                     # Draw horizontal line across most of the width
                     line_start_x = padding

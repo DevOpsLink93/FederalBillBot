@@ -32,81 +32,90 @@ try:
 except ImportError:
     from x_poster import XPoster
 
-# Import Proton Docs integration
-try:
-    from ..api.proton_docs_api import create_bill_document
-except ImportError:
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from api.proton_docs_api import create_bill_document
-
 LOG = logging.getLogger("congress_monitor")
 
 
 def fetch_recent_bills(api_key: str, limit: int = 250, days_back: int = 7) -> List[Dict[str, Any]]:
     """
-    Fetch bills from congress.gov API for the 119th Congress.
-    Retrieves bills filtered by "Introduced" status.
-    Results are sorted by update_dt from newest to oldest (most recently updated first).
+    Fetch bills from congress.gov API for the 119th Congress that were introduced
+    within the last N days using date filtering.
 
     Args:
         api_key: Congress API key
-        limit: Number of bills to fetch from API (default 250)
-        days_back: Number of days to look back (unused but kept for compatibility)
+        limit: Maximum number of bills to fetch from API (default 250)
+        days_back: Number of days to look back from today (default 7)
 
     Returns:
-        List of bill dictionaries from the 119th Congress in "Introduced" status, sorted by update date (newest first)
+        List of bill dictionaries from the 119th Congress introduced in the date range,
+        sorted with HR bills first (descending by number), then other bills.
     """
-    url = "https://api.congress.gov/v3/bill"
-    headers = {"X-Api-Key": api_key}
+    from datetime import datetime, timedelta
 
-    # Use valid API parameters: "introduced_dt" for the introduced date field
-    # Note: The introducedDate parameter causes a 500 error, so we use status filter instead
-    params = {
-        "limit": limit,
-        "congress": 119,  # Filter for 119th Congress
-        "status": "Introduced"  # Filter for bills in Introduced status
-    }
+    # Calculate date range
+    today = datetime.now().date()
+    from_date = today - timedelta(days=days_back)
+
+    # Format dates for API (ISO 8601 format: YYYY-MM-DDTHH:MM:SSZ)
+    # Use start of day for fromDateTime and end of day for toDateTime
+    from_datetime = f"{from_date.isoformat()}T00:00:00Z"
+    to_datetime = f"{today.isoformat()}T23:59:59Z"
+
+    # Use a session for connection pooling
+    session = requests.Session()
+    session.headers.update({"X-Api-Key": api_key})
 
     try:
-        response = requests.get(url, headers=headers, params=params)
-        response.raise_for_status()
-        data = response.json()
-        bills = data.get("bills", [])
-        
-        # Debug: Show first few bills returned
-        if bills:
-            first_bills = [f"{b.get('type', '')}.{b.get('number', '')}" for b in bills[:3]]
-            LOG.debug(f"First 3 bills from API: {first_bills}")
+        base_url = "https://api.congress.gov/v3/bill/119"
 
-        # Filter to 119th Congress only (API returns bills from multiple congresses)
-        congress_119_bills = [b for b in bills if b.get("congress") == 119]
-        LOG.debug(f"Filtered from {len(bills)} bills to {len(congress_119_bills)} bills in 119th Congress")
-        
-        # Sort bills - prioritize HR bills by number descending
-        hr_bills = []
-        other_bills = []
-        
-        for bill in congress_119_bills:
-            bill_type = bill.get("type", "").lower()
-            if bill_type == "hr":
-                hr_bills.append(bill)
-            else:
-                other_bills.append(bill)
-        
-        # Sort HR bills by number descending (highest first)
-        try:
-            hr_bills.sort(key=lambda b: int(b.get("number", 0)), reverse=True)
-        except (ValueError, TypeError) as e:
-            LOG.warning(f"Could not sort HR bills by number: {e}")
-        
-        all_bills = hr_bills + other_bills
+        LOG.info(f"Fetching bills from 119th Congress (most recent {limit} bills)...")
 
-        LOG.info(f"Successfully fetched {len(all_bills)} bills in 'Introduced' status from 119th Congress")
-        return all_bills
+        # Since the API sorting is not reliable, let's try a targeted approach
+        # Check for bills with high numbers that are likely to be recent
+        all_bills = []
+
+        # Check HR bills from 7040 onwards (around where recent bills are)
+        # Start from a higher number to catch bills introduced after the last run
+        start_num = 7040
+        # Check bills up to 7100 to catch any newly introduced bills
+        for bill_num in range(start_num, 7100):
+            bill_type = "hr"
+            try:
+                bill_detail = get_bill_details(api_key, "119", bill_type, str(bill_num))
+                if bill_detail:
+                    introduced_date_str = bill_detail.get("introducedDate")
+                    if introduced_date_str:
+                        try:
+                            introduced_date = datetime.fromisoformat(introduced_date_str.replace('Z', '+00:00')).date()
+                            if from_date <= introduced_date <= today:
+                                # Create bill data from the detail
+                                bill = {
+                                    "type": bill_type.upper(),
+                                    "number": str(bill_num),
+                                    "congress": "119",
+                                    "title": bill_detail.get("title", "")
+                                }
+                                bill_data = extract_bill_data(bill, bill_detail)
+                                all_bills.append(bill_data)
+                                LOG.debug(f"Found recent bill: {bill_type.upper()}.{bill_num} introduced on {introduced_date}")
+                        except (ValueError, TypeError) as e:
+                            LOG.debug(f"Could not parse date for {bill_type.upper()}.{bill_num}: {e}")
+            except Exception as e:
+                # Bill doesn't exist, continue
+                pass
+
+        # Limit to the requested number
+        bills_batch = all_bills[:limit]
+
+        total_available = len(all_bills)
+
+        session.close()
+
+        LOG.info(f"Successfully fetched {len(bills_batch)} bills introduced between {from_date} and {today}")
+        return bills_batch
 
     except Exception as e:
         LOG.error(f"Error fetching bills from Congress API: {e}")
+        session.close()
         return []
 
 
@@ -151,8 +160,8 @@ def extract_bill_data(bill: Dict[str, Any], bill_detail: Dict[str, Any] = None) 
         LOG.warning(f"Bill data is not a dict: {type(bill)}")
         return {}
     
-    bill_type = bill.get("type", "").upper()
-    bill_number = bill.get("number", "")
+    bill_type = bill.get("bill_type", bill.get("type", "")).upper()
+    bill_number = bill.get("bill_number", bill.get("number", ""))
     congress = bill.get("congress", "")
     title = bill.get("title", "Unknown")
 
@@ -163,6 +172,11 @@ def extract_bill_data(bill: Dict[str, Any], bill_detail: Dict[str, Any] = None) 
 
     if bill_detail and isinstance(bill_detail, dict):
         try:
+            # Extract introduced date
+            introduced_date_str = bill_detail.get("introducedDate")
+            if introduced_date_str:
+                introduced_date = introduced_date_str
+
             # Extract sponsor
             sponsors = bill_detail.get("sponsors", [])
             if sponsors and isinstance(sponsors, list) and len(sponsors) > 0:
@@ -253,7 +267,7 @@ def monitor_and_process_bills(api_key: str, limit: int = 50, post_to_x: bool = F
     Returns:
         Tuple of (number of bills processed, whether posting to X occurred)
     """
-    LOG.info(f"🔍 Starting bill monitoring - fetching most recent bills from last 7 days")
+    LOG.info(f"🔍 Starting bill monitoring - fetching bills introduced in the last 7 days")
 
     # Use larger limit to capture all bills in the date range
     # We'll prioritize HR bills and sort them by number descending
@@ -272,9 +286,9 @@ def monitor_and_process_bills(api_key: str, limit: int = 50, post_to_x: bool = F
         if not isinstance(bill, dict):
             LOG.warning(f"Skipping invalid bill object (not a dict): {type(bill)}")
             continue
-            
-        bill_type = bill.get("type", "").upper()
-        bill_number = bill.get("number", "")
+
+        bill_type = bill.get("bill_type", "").upper()
+        bill_number = bill.get("bill_number", "")
         congress = bill.get("congress", "")
 
         # Skip if missing required fields
@@ -299,21 +313,9 @@ def monitor_and_process_bills(api_key: str, limit: int = 50, post_to_x: bool = F
 
         # Get detailed information for the bill
         LOG.info(f"📋 Bill discovered: {bill_type}.{bill_number} (Congress {congress})")
-        bill_detail = get_bill_details(api_key, congress, bill_type, bill_number)
+        bill_detail = get_bill_details(api_key, congress, bill_type.lower(), bill_number)
         bill_data = extract_bill_data(bill, bill_detail)
         bills_to_process.append(bill_data)
-        
-        # Create Proton Docs document for this bill
-        try:
-            api_key_path = os.path.join(os.path.dirname(__file__), "..", "api", "proton_api_key.txt")
-            api_url_path = os.path.join(os.path.dirname(__file__), "..", "api", "proton_api_url.txt")
-            doc_result = create_bill_document(bill_data, api_key_path, api_url_path)
-            if doc_result and doc_result.get('success'):
-                LOG.info(f"📄 Created Proton Doc for {bill_type}.{bill_number}: {doc_result.get('document_id')}")
-            elif doc_result is None:
-                LOG.debug(f"Proton Docs integration not configured for {bill_type}.{bill_number} (optional feature)")
-        except Exception as e:
-            LOG.debug(f"Proton Docs creation skipped for {bill_type}.{bill_number}: {e}")
 
     # Process bills into posts and store in database
     if bills_to_process:
