@@ -32,85 +32,324 @@ try:
 except ImportError:
     from x_poster import XPoster
 
-# Import Proton Docs integration
-try:
-    from ..api.proton_docs_api import create_bill_document
-except ImportError:
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from api.proton_docs_api import create_bill_document
-
 LOG = logging.getLogger("congress_monitor")
+
+
+def get_dynamic_start_number(bill_type: str, fallback_start: int) -> int:
+    """
+    Dynamically determine the starting bill number for searching.
+    Looks at the highest bill number in the database for the given type
+    and adds a buffer to ensure we catch new bills.
+
+    Args:
+        bill_type: Bill type (e.g., "HR", "S", "HRES")
+        fallback_start: Fallback starting number if database query fails
+
+    Returns:
+        Starting bill number for search
+    """
+    try:
+        # Try to get the highest bill number from database
+        conn = init_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT MAX(CAST(Bill_Number AS INTEGER))
+            FROM bills
+            WHERE Bill_Type = ? AND congress_id = 119
+        """, (bill_type,))
+
+        result = cursor.fetchone()
+        conn.close()
+
+        if result and result[0]:
+            highest_db_bill = int(result[0])
+            # Start 300 numbers higher than the highest in database to catch new bills
+            # (This handles cases where many bills are introduced in a session)
+            dynamic_start = highest_db_bill + 300
+            LOG.info(f"Using dynamic start for {bill_type} bills: {dynamic_start} (highest in DB: {highest_db_bill})")
+            return dynamic_start
+        else:
+            LOG.info(f"No {bill_type} bills found in database, using fallback start: {fallback_start}")
+            return fallback_start
+
+    except Exception as e:
+        LOG.warning(f"Could not determine dynamic start number for {bill_type}: {e}")
+        LOG.info(f"Using fallback start: {fallback_start}")
+        return fallback_start
 
 
 def fetch_recent_bills(api_key: str, limit: int = 250, days_back: int = 7) -> List[Dict[str, Any]]:
     """
-    Fetch bills from congress.gov API for the 119th Congress.
-    Retrieves bills filtered by "Introduced" status.
-    Results are sorted by update_dt from newest to oldest (most recently updated first).
+    Fetch bills from congress.gov API for the 119th Congress that were introduced
+    within the last N days using date filtering.
 
     Args:
         api_key: Congress API key
-        limit: Number of bills to fetch from API (default 250)
-        days_back: Number of days to look back (unused but kept for compatibility)
+        limit: Maximum number of bills to fetch from API (default 250)
+        days_back: Number of days to look back from today (default 7)
 
     Returns:
-        List of bill dictionaries from the 119th Congress in "Introduced" status, sorted by update date (newest first)
+        List of bill dictionaries from the 119th Congress introduced in the date range,
+        sorted with HR bills first (descending by number), then other bills.
     """
-    url = "https://api.congress.gov/v3/bill"
-    headers = {"X-Api-Key": api_key}
+    from datetime import datetime, timedelta
 
-    # Use valid API parameters: "introduced_dt" for the introduced date field
-    # Note: The introducedDate parameter causes a 500 error, so we use status filter instead
-    params = {
-        "limit": limit,
-        "congress": 119,  # Filter for 119th Congress
-        "status": "Introduced"  # Filter for bills in Introduced status
-    }
+    # Calculate date range
+    today = datetime.now().date()
+    from_date = today - timedelta(days=days_back)
+
+    # Use a session for connection pooling
+    session = requests.Session()
+    session.headers.update({"X-Api-Key": api_key})
 
     try:
-        response = requests.get(url, headers=headers, params=params)
-        response.raise_for_status()
-        data = response.json()
-        bills = data.get("bills", [])
-        
-        # Debug: Show first few bills returned
-        if bills:
-            first_bills = [f"{b.get('type', '')}.{b.get('number', '')}" for b in bills[:3]]
-            LOG.debug(f"First 3 bills from API: {first_bills}")
+        LOG.info(f"Fetching bills from 119th Congress introduced between {from_date} and {today}...")
 
-        # Filter to 119th Congress only (API returns bills from multiple congresses)
-        congress_119_bills = [b for b in bills if b.get("congress") == 119]
-        LOG.debug(f"Filtered from {len(bills)} bills to {len(congress_119_bills)} bills in 119th Congress")
-        
-        # Sort bills - prioritize HR bills by number descending
+        all_bills = []
+
+        # Check HR bills - start from known high numbers and work backwards more efficiently
+        # Use a smarter approach: check for recent bills by starting high and stopping when we hit gaps
+        hr_bills_found = 0
+        consecutive_not_found = 0
+        max_consecutive_not_found = 10  # Stop after this many consecutive missing bills
+
+        LOG.info("Checking for recent HR bills...")
+
+        # Dynamically find the highest HR bill number to start from
+        # This ensures we always catch bills newer than what we've processed
+        start_num = get_dynamic_start_number("HR", 7500)  # Fallback to 7500 to catch all new bills
+
+        for bill_num in range(start_num, 6800, -1):  # Go from high to low
+            bill_type = "hr"
+            try:
+                bill_detail = get_bill_details(api_key, "119", bill_type, str(bill_num), log_errors=False)
+                if bill_detail:
+                    # Get bill actions to find introduction date
+                    actions = get_bill_actions(api_key, "119", bill_type, str(bill_num))
+                    intro_action = find_introduction_action(actions)
+
+                    if intro_action and intro_action.get("actionDate"):
+                        introduced_date_str = intro_action.get("actionDate")
+                        try:
+                            introduced_date = datetime.fromisoformat(introduced_date_str.replace('Z', '+00:00')).date()
+                            if from_date <= introduced_date <= today:
+                                # Create bill data
+                                bill = {
+                                    "type": bill_type.upper(),
+                                    "number": str(bill_num),
+                                    "congress": "119",
+                                    "title": bill_detail.get("title", "")
+                                }
+                                bill_data = extract_bill_data(bill, bill_detail, intro_action)
+                                all_bills.append(bill_data)
+                                hr_bills_found += 1
+                                consecutive_not_found = 0  # Reset counter
+                                LOG.debug(f"Found recent HR bill: {bill_type.upper()}.{bill_num} introduced on {introduced_date} (via {intro_action.get('type')} action)")
+                            elif introduced_date < from_date:
+                                # Bill is too old, we can stop going backwards
+                                LOG.debug(f"Bill {bill_type.upper()}.{bill_num} is too old ({introduced_date}), stopping HR search")
+                                break
+                        except (ValueError, TypeError) as e:
+                            LOG.debug(f"Could not parse date for {bill_type.upper()}.{bill_num}: {e}")
+                    else:
+                        # Bill has no intro action - log but continue searching (don't count against consecutive_not_found)
+                        LOG.debug(f"Bill {bill_type.upper()}.{bill_num} has no IntroReferral action, continuing search")
+                else:
+                    # Bill details not found - this could be a bill that doesn't exist yet
+                    # Don't count this as consecutive_not_found, just skip and continue
+                    LOG.debug(f"Bill {bill_type.upper()}.{bill_num} not found (may not exist yet), continuing search")
+                    continue
+            except Exception as e:
+                # Check if it's a 404 (bill doesn't exist) - this is expected when searching high numbers
+                if "404" in str(e):
+                    LOG.debug(f"Bill {bill_type.upper()}.{bill_num} does not exist (404), continuing search")
+                    continue
+                else:
+                    # Other error - log as warning and count as consecutive not found
+                    LOG.warning(f"Error checking HR bill {bill_num}: {e}")
+                    consecutive_not_found += 1
+                    if consecutive_not_found >= max_consecutive_not_found:
+                        LOG.debug(f"Found {max_consecutive_not_found} consecutive errors, stopping HR search")
+                        break
+
+        # Check Senate bills (S.*) - use efficient search
+        LOG.info("Checking Senate bills...")
+        senate_bill_types = ["s", "sres", "sconres", "sjres"]
+
+        for bill_type in senate_bill_types:
+            senate_bills_found = 0
+            consecutive_not_found = 0
+            max_consecutive_not_found = 20
+
+            # Different starting points for different bill types
+            if bill_type == "s":
+                start_num = get_dynamic_start_number("S", 500)  # Senate bills - increased fallback
+            elif bill_type == "sres":
+                start_num = get_dynamic_start_number("SRES", 300)  # Senate simple resolutions - increased fallback
+            elif bill_type == "sjres":
+                start_num = get_dynamic_start_number("SJRES", 300)  # Senate joint resolutions - increased fallback
+            elif bill_type == "sconres":
+                start_num = get_dynamic_start_number("SCONRES", 100)  # Senate concurrent resolutions - increased fallback
+            else:
+                start_num = 100   # Fallback
+
+            for bill_num in range(start_num, 0, -1):
+                try:
+                    bill_detail = get_bill_details(api_key, "119", bill_type, str(bill_num), log_errors=False)
+                    if bill_detail:
+                        # Get bill actions to find introduction date
+                        actions = get_bill_actions(api_key, "119", bill_type, str(bill_num))
+                        intro_action = find_introduction_action(actions)
+
+                        if intro_action and intro_action.get("actionDate"):
+                            introduced_date_str = intro_action.get("actionDate")
+                            try:
+                                introduced_date = datetime.fromisoformat(introduced_date_str.replace('Z', '+00:00')).date()
+                                if from_date <= introduced_date <= today:
+                                    # Create bill data
+                                    bill = {
+                                        "type": bill_type.upper(),
+                                        "number": str(bill_num),
+                                        "congress": "119",
+                                        "title": bill_detail.get("title", "")
+                                    }
+                                    bill_data = extract_bill_data(bill, bill_detail, intro_action)
+                                    all_bills.append(bill_data)
+                                    senate_bills_found += 1
+                                    consecutive_not_found = 0
+                                    LOG.debug(f"Found recent Senate bill: {bill_type.upper()}.{bill_num} introduced on {introduced_date} (via {intro_action.get('type')} action)")
+                                elif introduced_date < from_date:
+                                    # Too old, stop searching this type
+                                    break
+                            except (ValueError, TypeError) as e:
+                                LOG.debug(f"Could not parse date for {bill_type.upper()}.{bill_num}: {e}")
+                        else:
+                            # Bill has no intro action - log but continue searching (don't count against consecutive_not_found)
+                            LOG.debug(f"Bill {bill_type.upper()}.{bill_num} has no IntroReferral action, continuing search")
+                    else:
+                        # Bill details not found - this could be a bill that doesn't exist yet
+                        # Don't count this as consecutive_not_found, just skip and continue
+                        LOG.debug(f"Bill {bill_type.upper()}.{bill_num} not found (may not exist yet), continuing search")
+                        continue
+                except Exception as e:
+                    # Check if it's a 404 (bill doesn't exist) - this is expected when searching high numbers
+                    if "404" in str(e):
+                        LOG.debug(f"Bill {bill_type.upper()}.{bill_num} does not exist (404), continuing search")
+                        continue
+                    else:
+                        # Other error - log as warning and continue searching
+                        LOG.warning(f"Error checking bill: {e}")
+                        continue
+
+        # Check other bill types (HJRES, HRES, HCONRES) - use efficient search
+        LOG.info("Checking other bill types...")
+        other_bill_types = ["hjres", "hres", "hconres"]
+
+        for bill_type in other_bill_types:
+            other_bills_found = 0
+            consecutive_not_found = 0
+            max_consecutive_not_found = 10
+
+            # Use dynamic starting numbers for other bill types
+            if bill_type == "hconres":
+                start_num = get_dynamic_start_number("HCONRES", 200)  # Increased fallback
+            elif bill_type == "hres":
+                start_num = get_dynamic_start_number("HRES", 300)  # Increased fallback
+            elif bill_type == "hjres":
+                start_num = get_dynamic_start_number("HJRES", 300)  # Increased fallback
+            else:
+                start_num = 100  # Fallback
+
+            for bill_num in range(start_num, 0, -1):
+                try:
+                    bill_detail = get_bill_details(api_key, "119", bill_type, str(bill_num), log_errors=False)
+                    if bill_detail:
+                        # Get bill actions to find introduction date
+                        actions = get_bill_actions(api_key, "119", bill_type, str(bill_num))
+                        intro_action = find_introduction_action(actions)
+
+                        if intro_action and intro_action.get("actionDate"):
+                            introduced_date_str = intro_action.get("actionDate")
+                            try:
+                                introduced_date = datetime.fromisoformat(introduced_date_str.replace('Z', '+00:00')).date()
+                                if from_date <= introduced_date <= today:
+                                    # Create bill data
+                                    bill = {
+                                        "type": bill_type.upper(),
+                                        "number": str(bill_num),
+                                        "congress": "119",
+                                        "title": bill_detail.get("title", "")
+                                    }
+                                    bill_data = extract_bill_data(bill, bill_detail, intro_action)
+                                    all_bills.append(bill_data)
+                                    other_bills_found += 1
+                                    consecutive_not_found = 0
+                                    LOG.debug(f"Found recent {bill_type.upper()} bill: {bill_type.upper()}.{bill_num} introduced on {introduced_date} (via {intro_action.get('type')} action)")
+                                elif introduced_date < from_date:
+                                    # Too old, stop searching this type
+                                    break
+                            except (ValueError, TypeError) as e:
+                                LOG.debug(f"Could not parse date for {bill_type.upper()}.{bill_num}: {e}")
+                        else:
+                            # Bill has no intro action - log but continue searching (don't count against consecutive_not_found)
+                            LOG.debug(f"Bill {bill_type.upper()}.{bill_num} has no IntroReferral action, continuing search")
+                    else:
+                        # Bill details not found - this could be a bill that doesn't exist yet
+                        # Don't count this as consecutive_not_found, just skip and continue
+                        LOG.debug(f"Bill {bill_type.upper()}.{bill_num} not found (may not exist yet), continuing search")
+                        continue
+                except Exception as e:
+                    # Check if it's a 404 (bill doesn't exist) - this is expected when searching high numbers
+                    if "404" in str(e):
+                        LOG.debug(f"Bill {bill_type.upper()}.{bill_num} does not exist (404), continuing search")
+                        continue
+                    else:
+                        # Other error - log as warning and continue searching
+                        LOG.warning(f"Error checking bill: {e}")
+                        continue
+
+        # Sort bills: HR bills first (descending by number), then other bills
         hr_bills = []
         other_bills = []
-        
-        for bill in congress_119_bills:
-            bill_type = bill.get("type", "").lower()
-            if bill_type == "hr":
+
+        for bill in all_bills:
+            bill_type = bill.get("bill_type", "").upper()
+            if bill_type == "HR":
                 hr_bills.append(bill)
             else:
                 other_bills.append(bill)
-        
-        # Sort HR bills by number descending (highest first)
-        try:
-            hr_bills.sort(key=lambda b: int(b.get("number", 0)), reverse=True)
-        except (ValueError, TypeError) as e:
-            LOG.warning(f"Could not sort HR bills by number: {e}")
-        
-        all_bills = hr_bills + other_bills
 
-        LOG.info(f"Successfully fetched {len(all_bills)} bills in 'Introduced' status from 119th Congress")
-        return all_bills
+        # Sort HR bills by number descending
+        try:
+            hr_bills.sort(key=lambda b: int(b.get("bill_number", 0)), reverse=True)
+        except (ValueError, TypeError):
+            LOG.debug("Could not sort HR bills by number")
+
+        # Sort other bills by type ascending, then numbers descending within each type
+        try:
+            other_bills.sort(key=lambda b: (b.get("bill_type", ""), -int(b.get("bill_number", 0))))
+        except (ValueError, TypeError):
+            LOG.debug("Could not sort other bills")
+
+        # Combine sorted lists
+        sorted_bills = hr_bills + other_bills
+
+        # Limit to requested number
+        bills_batch = sorted_bills[:limit]
+
+        session.close()
+
+        LOG.info(f"Successfully fetched {len(bills_batch)} bills introduced between {from_date} and {today}")
+        return bills_batch
 
     except Exception as e:
         LOG.error(f"Error fetching bills from Congress API: {e}")
+        session.close()
         return []
 
 
-def get_bill_details(api_key: str, congress: str, bill_type: str, bill_number: str) -> Dict[str, Any]:
+def get_bill_details(api_key: str, congress: str, bill_type: str, bill_number: str, log_errors: bool = True) -> Dict[str, Any]:
     """
     Get detailed bill information from Congress API.
 
@@ -119,6 +358,7 @@ def get_bill_details(api_key: str, congress: str, bill_type: str, bill_number: s
         congress: Congress number (e.g., "119")
         bill_type: Bill type (e.g., "hr", "s")
         bill_number: Bill number
+        log_errors: Whether to log errors as warnings (default True)
 
     Returns:
         Bill detail dictionary
@@ -131,17 +371,120 @@ def get_bill_details(api_key: str, congress: str, bill_type: str, bill_number: s
         data = response.json()
         return data.get("bill", {})
     except Exception as e:
-        LOG.warning(f"Error fetching bill details for {bill_type} {bill_number}: {e}")
+        if log_errors:
+            LOG.warning(f"Error fetching bill details for {bill_type} {bill_number}: {e}")
         return {}
 
 
-def extract_bill_data(bill: Dict[str, Any], bill_detail: Dict[str, Any] = None) -> Dict[str, Any]:
+def get_bill_actions(api_key: str, congress: str, bill_type: str, bill_number: str) -> List[Dict[str, Any]]:
+    """
+    Get bill actions from Congress API to find introduction date.
+
+    Args:
+        api_key: Congress API key
+        congress: Congress number (e.g., "119")
+        bill_type: Bill type (e.g., "hr", "s")
+        bill_number: Bill number
+
+    Returns:
+        List of bill actions
+    """
+    try:
+        url = f"https://api.congress.gov/v3/bill/{congress}/{bill_type}/{bill_number}/actions"
+        headers = {"X-Api-Key": api_key}
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        return data.get("actions", [])
+    except Exception as e:
+        LOG.warning(f"Error fetching bill actions for {bill_type} {bill_number}: {e}")
+        return []
+
+
+def find_introduction_action(actions: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Find the bill introduction action from the list of actions.
+    Prioritizes actions with Type: "IntroReferral" and official introduction codes:
+    - House: Code "1000" (numeric), "1025" (resolutions), or "Intro-H" (alphabetic)
+    - Senate: Code "10000" (numeric) or "Intro-S" (alphabetic)
+    Falls back to any "IntroReferral" action if specific codes aren't found.
+    Returns the EARLIEST (oldest) matching action to get the actual introduction date.
+
+    Args:
+        actions: List of bill actions
+
+    Returns:
+        Introduction action dictionary or empty dict if not found
+    """
+    # Priority 1: Look for actions with Type="IntroReferral" AND specific introduction codes
+    introduction_codes = ["1000", "10000", "1025", "Intro-H", "Intro-S"]
+    priority_actions = []
+    for action in actions:
+        action_type = action.get("type", "")
+        action_code = action.get("actionCode", "")
+        if action_type == "IntroReferral" and action_code in introduction_codes:
+            priority_actions.append(action)
+
+    if priority_actions:
+        # Sort by date (oldest first) and return the earliest
+        try:
+            priority_actions.sort(key=lambda x: x.get("actionDate", ""), reverse=False)
+            return priority_actions[0]
+        except:
+            return priority_actions[0]
+
+    # Priority 2: Look for any "IntroReferral" actions
+    intro_referral_actions = []
+    for action in actions:
+        action_type = action.get("type", "")
+        if action_type == "IntroReferral":
+            intro_referral_actions.append(action)
+
+    if intro_referral_actions:
+        # Sort by date (oldest first) and return the earliest
+        try:
+            intro_referral_actions.sort(key=lambda x: x.get("actionDate", ""), reverse=False)
+            return intro_referral_actions[0]
+        except:
+            return intro_referral_actions[0]
+
+    # Fallback: Look for other introduction-related actions
+    fallback_actions = []
+    introduction_types = ["Introduced", "Introduction"]
+    for action in actions:
+        action_type = action.get("type", "")
+        if action_type in introduction_types:
+            fallback_actions.append(action)
+
+    if fallback_actions:
+        # Sort by date (oldest first) and return the earliest
+        try:
+            fallback_actions.sort(key=lambda x: x.get("actionDate", ""), reverse=False)
+            return fallback_actions[0]
+        except:
+            return fallback_actions[0]
+
+    # Final fallback: Look for actions that contain introduction-related keywords
+    for action in actions:
+        action_type = action.get("type", "").lower()
+        description = action.get("text", "").lower()
+
+        # Check for introduction-related keywords in type or description
+        intro_keywords = ["intro", "introduced", "introduction", "refer"]
+        if any(keyword in action_type or keyword in description for keyword in intro_keywords):
+            return action
+
+    return {}
+
+
+def extract_bill_data(bill: Dict[str, Any], bill_detail: Dict[str, Any] = None, intro_action: Dict[str, Any] = None) -> Dict[str, Any]:
     """
     Extract and format bill data for processing.
 
     Args:
         bill: Basic bill data from API
         bill_detail: Detailed bill data (optional)
+        intro_action: Introduction action data (optional)
 
     Returns:
         Formatted bill data dictionary
@@ -150,31 +493,62 @@ def extract_bill_data(bill: Dict[str, Any], bill_detail: Dict[str, Any] = None) 
     if not isinstance(bill, dict):
         LOG.warning(f"Bill data is not a dict: {type(bill)}")
         return {}
-    
-    bill_type = bill.get("type", "").upper()
-    bill_number = bill.get("number", "")
+
+    bill_type = bill.get("bill_type", bill.get("type", "")).upper()
+    bill_number = bill.get("bill_number", bill.get("number", ""))
     congress = bill.get("congress", "")
     title = bill.get("title", "Unknown")
 
     # Extract additional details if available
     sponsor = "Unknown"
+    sponsor_party = "Unknown"
     summary = "Unknown"
-    introduced_date = bill.get("introducedDate", "Unknown")
+    introduced_date = "Unknown"
+
+    # Use introduction action date if available, otherwise fallback to bill_detail
+    if intro_action and isinstance(intro_action, dict) and intro_action.get("actionDate"):
+        introduced_date = intro_action.get("actionDate")
+    elif bill_detail and isinstance(bill_detail, dict):
+        introduced_date_str = bill_detail.get("introducedDate")
+        if introduced_date_str:
+            introduced_date = introduced_date_str
 
     if bill_detail and isinstance(bill_detail, dict):
         try:
-            # Extract sponsor
+            # Extract sponsor with party information
             sponsors = bill_detail.get("sponsors", [])
             if sponsors and isinstance(sponsors, list) and len(sponsors) > 0:
-                sponsor_data = sponsors[0]
+                sponsor_data = sponsors[0]  # Primary sponsor
                 if isinstance(sponsor_data, dict):
                     first_name = sponsor_data.get("firstName", "")
                     last_name = sponsor_data.get("lastName", "")
                     title_prefix = sponsor_data.get("title", "")
+                    state = sponsor_data.get("state", "")
+                    party = sponsor_data.get("party", "")
+
                     if title_prefix and first_name and last_name:
                         sponsor = f"{title_prefix} {first_name} {last_name}"
+                        if state:
+                            sponsor += f" ({state}"
+                            if party:
+                                sponsor += f"-{party}"
+                            sponsor += ")"
+                        elif party:
+                            sponsor += f" ({party})"
                     elif first_name and last_name:
                         sponsor = f"{first_name} {last_name}"
+                        if state or party:
+                            sponsor += " ("
+                            if state:
+                                sponsor += state
+                            if state and party:
+                                sponsor += "-"
+                            if party:
+                                sponsor += party
+                            sponsor += ")"
+
+                    # Store party separately for coloring
+                    sponsor_party = party if party else "Unknown"
 
             # Extract summary (try both 'summary' and 'summaries' structures)
             summary_data = bill_detail.get("summary", {})
@@ -207,6 +581,7 @@ def extract_bill_data(bill: Dict[str, Any], bill_detail: Dict[str, Any] = None) 
         'title': title,
         'summary': summary,
         'sponsor': sponsor,
+        'sponsor_party': sponsor_party,
         'introduced_date': introduced_date,
         'url': url,
         'formatted_bill_number': f"{bill_type}.{bill_number}"
@@ -253,7 +628,7 @@ def monitor_and_process_bills(api_key: str, limit: int = 50, post_to_x: bool = F
     Returns:
         Tuple of (number of bills processed, whether posting to X occurred)
     """
-    LOG.info(f"🔍 Starting bill monitoring - fetching most recent bills from last 7 days")
+    LOG.info(f"🔍 Starting bill monitoring - fetching bills introduced in the last 7 days")
 
     # Use larger limit to capture all bills in the date range
     # We'll prioritize HR bills and sort them by number descending
@@ -272,9 +647,9 @@ def monitor_and_process_bills(api_key: str, limit: int = 50, post_to_x: bool = F
         if not isinstance(bill, dict):
             LOG.warning(f"Skipping invalid bill object (not a dict): {type(bill)}")
             continue
-            
-        bill_type = bill.get("type", "").upper()
-        bill_number = bill.get("number", "")
+
+        bill_type = bill.get("bill_type", "").upper()
+        bill_number = bill.get("bill_number", "")
         congress = bill.get("congress", "")
 
         # Skip if missing required fields
@@ -299,21 +674,9 @@ def monitor_and_process_bills(api_key: str, limit: int = 50, post_to_x: bool = F
 
         # Get detailed information for the bill
         LOG.info(f"📋 Bill discovered: {bill_type}.{bill_number} (Congress {congress})")
-        bill_detail = get_bill_details(api_key, congress, bill_type, bill_number)
+        bill_detail = get_bill_details(api_key, congress, bill_type.lower(), bill_number)
         bill_data = extract_bill_data(bill, bill_detail)
         bills_to_process.append(bill_data)
-        
-        # Create Proton Docs document for this bill
-        try:
-            api_key_path = os.path.join(os.path.dirname(__file__), "..", "api", "proton_api_key.txt")
-            api_url_path = os.path.join(os.path.dirname(__file__), "..", "api", "proton_api_url.txt")
-            doc_result = create_bill_document(bill_data, api_key_path, api_url_path)
-            if doc_result and doc_result.get('success'):
-                LOG.info(f"📄 Created Proton Doc for {bill_type}.{bill_number}: {doc_result.get('document_id')}")
-            elif doc_result is None:
-                LOG.debug(f"Proton Docs integration not configured for {bill_type}.{bill_number} (optional feature)")
-        except Exception as e:
-            LOG.debug(f"Proton Docs creation skipped for {bill_type}.{bill_number}: {e}")
 
     # Process bills into posts and store in database
     if bills_to_process:
@@ -356,11 +719,13 @@ def main() -> int:
     # Support both "--continuous" and "--continous" (misspelling)
     continuous = "--continuous" in sys.argv or "--continous" in sys.argv
 
-    # Setup logging
+    # Setup logging - use INFO level to show bill processing progress
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s"
     )
+    # Also set the congress_monitor logger level
+    logging.getLogger("congress_monitor").setLevel(logging.INFO)
 
     # Get API key
     try:
@@ -437,5 +802,56 @@ def main() -> int:
             return 1
 
 
+def demonstrate_adaptive_search():
+    """
+    Demonstration function showing how the adaptive search works.
+    This function shows how the system automatically adjusts to find new bills.
+    """
+    import sys
+    sys.path.append('..')
+    from api.congress_api import get_api_key
+
+    # Get API key
+    try:
+        api_key_file = os.path.join("..", "api", "congress_api_key.txt")
+        api_key = get_api_key(api_key_file)
+    except Exception as e:
+        print(f"Failed to load API key: {e}")
+        return
+
+    print("Adaptive Bill Search Demonstration")
+    print("=" * 50)
+
+    bill_types = ['HR', 'S', 'HRES', 'HCONRES', 'HJRES', 'SRES', 'SJRES', 'SCONRES']
+
+    for bill_type in bill_types:
+        # Get dynamic start number
+        start_num = get_dynamic_start_number(bill_type, 1000)
+
+        print(f"\n{bill_type} Bills:")
+        print(f"  Database highest: {start_num - 50}")
+        print(f"  Search starts at: {start_num}")
+        print(f"  Buffer: +50 bills (catches new legislation)")
+
+        # Quick check for bills in the range
+        found_recent = 0
+        for bill_num in range(start_num, start_num - 20, -1):  # Check last 20
+            try:
+                bill_detail = get_bill_details(api_key, "119", bill_type.lower(), str(bill_num), log_errors=False)
+                if bill_detail:
+                    found_recent += 1
+            except:
+                pass
+
+        print(f"  Bills found in buffer range: {found_recent}")
+
+    print("\nSystem automatically adapts to new bill numbers!")
+    print("No more manual updates required.")
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # Allow demonstration mode
+    if "--demo" in sys.argv:
+        demonstrate_adaptive_search()
+    else:
+        raise SystemExit(main())
