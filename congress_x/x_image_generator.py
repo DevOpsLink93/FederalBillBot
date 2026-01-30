@@ -103,7 +103,7 @@ class XImageGenerator:
 
             # Colors for background stripes
             house_bg_color = (220, 230, 255)  # Light blue for House
-            senate_bg_color = (255, 220, 220)  # Light red for Senate
+            senate_bg_color = (245, 245, 245)  # Light gray for Senate (removed red background)
             other_bg_color = (245, 245, 245)  # Light gray for others
 
             # Create title
