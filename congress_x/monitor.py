@@ -617,7 +617,14 @@ def countdown_timer(seconds: int, message: str = "Next scan in") -> None:
 def monitor_and_process_bills(api_key: str, limit: int = 50, post_to_x: bool = False, aggregate_all: bool = False) -> tuple[int, bool]:
     """
     Main monitoring function that fetches recent bills and processes them.
-    Can process all bills from scan or only new ones.
+    Separates bills by type (House vs Senate) and posts them as a thread.
+    
+    Threading logic:
+    - House bills in main post (if any)
+    - Senate bills in reply thread (if any and House bills exist)
+    - Senate bills as main post (if no House bills)
+    - Single post (if only House bills)
+    - No post (if no bills)
 
     Args:
         api_key: Congress API key
@@ -631,7 +638,6 @@ def monitor_and_process_bills(api_key: str, limit: int = 50, post_to_x: bool = F
     LOG.info(f"🔍 Starting bill monitoring - fetching bills introduced in the last 7 days")
 
     # Use larger limit to capture all bills in the date range
-    # We'll prioritize HR bills and sort them by number descending
     bills = fetch_recent_bills(api_key, limit=250, days_back=7)
     if not bills:
         LOG.warning("No bills fetched from API")
@@ -639,9 +645,10 @@ def monitor_and_process_bills(api_key: str, limit: int = 50, post_to_x: bool = F
 
     # Initialize XPoster for processing
     poster = XPoster()
-    bills_to_process = []
+    house_bills_to_process = []
+    senate_bills_to_process = []
 
-    # Collect bills based on aggregation mode
+    # Collect and separate bills by type
     for bill in bills:
         # Ensure bill is a dictionary
         if not isinstance(bill, dict):
@@ -676,32 +683,42 @@ def monitor_and_process_bills(api_key: str, limit: int = 50, post_to_x: bool = F
         LOG.info(f"📋 Bill discovered: {bill_type}.{bill_number} (Congress {congress})")
         bill_detail = get_bill_details(api_key, congress, bill_type.lower(), bill_number)
         bill_data = extract_bill_data(bill, bill_detail)
-        bills_to_process.append(bill_data)
+        
+        # Separate bills by chamber
+        # House bills: HR, HRES, HJRES, HCONRES
+        # Senate bills: S, SRES, SJRES, SCONRES
+        if bill_type.startswith("H"):
+            house_bills_to_process.append(bill_data)
+        elif bill_type.startswith("S"):
+            senate_bills_to_process.append(bill_data)
 
-    # Process bills into posts and store in database
-    if bills_to_process:
+    # Process bills with threaded posting
+    if house_bills_to_process or senate_bills_to_process:
         try:
-            # Choose PNG filename based on mode and create timestamped name
+            # Create timestamped filename base
             from datetime import datetime
             timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            png_basename = f"fedbillsummary-{timestamp}.png"
-            png_filename = os.path.join(os.path.dirname(__file__), "..", "summary_images", png_basename)
-            processed_count, x_posting_successful = poster.process_bills_into_posts(bills_to_process, post_to_x=post_to_x, create_png=True, png_filename=png_filename)
+            png_filename_base = os.path.join(os.path.dirname(__file__), "..", "summary_images", f"fedbillsummary-{timestamp}")
+            
+            # Use threaded posting function
+            processed_count, x_posting_successful = poster.post_bills_as_thread(
+                house_bills=house_bills_to_process,
+                senate_bills=senate_bills_to_process,
+                post_to_x=post_to_x,
+                create_png=True,
+                png_filename_base=png_filename_base
+            )
             posting_occurred = x_posting_successful
-            if aggregate_all:
-                LOG.info(f"✅ Successfully aggregated {processed_count} bills and created PNG image")
-            elif post_to_x:
-                LOG.info(f"✅ Successfully processed {processed_count} bills into posts and posted to X.com")
+            
+            if post_to_x:
+                LOG.info(f"✅ Successfully processed {processed_count} bills into threaded posts and posted to X.com")
             else:
-                LOG.info(f"✅ Successfully processed {processed_count} bills into posts and created PNG image")
+                LOG.info(f"✅ Successfully processed {processed_count} bills into PNG images and text records")
         except Exception as e:
-            LOG.error(f"Failed to process bills into posts: {e}")
+            LOG.error(f"Failed to process bills with threading: {e}")
             return 0, False
     else:
-        if aggregate_all:
-            LOG.info("No bills to aggregate")
-        else:
-            LOG.info("No new bills to process")
+        LOG.info("No new bills to process")
         processed_count = 0
         posting_occurred = False
 
