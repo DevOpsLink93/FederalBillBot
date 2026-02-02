@@ -64,9 +64,9 @@ def get_dynamic_start_number(bill_type: str, fallback_start: int) -> int:
 
         if result and result[0]:
             highest_db_bill = int(result[0])
-            # Start 300 numbers higher than the highest in database to catch new bills
-            # (This handles cases where many bills are introduced in a session)
-            dynamic_start = highest_db_bill + 300
+            # Start 100 numbers higher than the highest in database to catch new bills
+            # (Scans the next 100 bills in the House or Senate)
+            dynamic_start = highest_db_bill + 100
             LOG.info(f"Using dynamic start for {bill_type} bills: {dynamic_start} (highest in DB: {highest_db_bill})")
             return dynamic_start
         else:
@@ -406,7 +406,7 @@ def find_introduction_action(actions: List[Dict[str, Any]]) -> Dict[str, Any]:
     Find the bill introduction action from the list of actions.
     Prioritizes actions with Type: "IntroReferral" and official introduction codes:
     - House: Code "1000" (numeric), "1025" (resolutions), or "Intro-H" (alphabetic)
-    - Senate: Code "10000" (numeric) or "Intro-S" (alphabetic)
+    - Senate: Code "10000" (numeric), "17000" (Senate resolutions), or "Intro-S" (alphabetic)
     Falls back to any "IntroReferral" action if specific codes aren't found.
     Returns the EARLIEST (oldest) matching action to get the actual introduction date.
 
@@ -417,13 +417,22 @@ def find_introduction_action(actions: List[Dict[str, Any]]) -> Dict[str, Any]:
         Introduction action dictionary or empty dict if not found
     """
     # Priority 1: Look for actions with Type="IntroReferral" AND specific introduction codes
-    introduction_codes = ["1000", "10000", "1025", "Intro-H", "Intro-S"]
+    # Code 17000 is for Senate resolutions (SRES, SJRES, SCONRES)
+    introduction_codes = ["1000", "10000", "1025", "17000", "Intro-H", "Intro-S"]
     priority_actions = []
     for action in actions:
         action_type = action.get("type", "")
         action_code = action.get("actionCode", "")
         if action_type == "IntroReferral" and action_code in introduction_codes:
             priority_actions.append(action)
+    
+    # Priority 1b: Also check for Floor actions with code 17000 (Senate resolutions)
+    if not priority_actions:
+        for action in actions:
+            action_type = action.get("type", "")
+            action_code = action.get("actionCode", "")
+            if action_type == "Floor" and action_code == "17000":
+                priority_actions.append(action)
 
     if priority_actions:
         # Sort by date (oldest first) and return the earliest
@@ -698,7 +707,7 @@ def monitor_and_process_bills(api_key: str, limit: int = 50, post_to_x: bool = F
             # Create timestamped filename base
             from datetime import datetime
             timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            png_filename_base = os.path.join(os.path.dirname(__file__), "..", "summary_images", f"fedbillsummary-{timestamp}")
+            png_filename_base = os.path.join(os.path.dirname(__file__), "..", "summary_images", f"fedbillsummary-{timestamp}.png")
             
             # Use threaded posting function
             processed_count, x_posting_successful = poster.post_bills_as_thread(

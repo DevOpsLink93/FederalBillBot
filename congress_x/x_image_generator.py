@@ -118,17 +118,25 @@ class XImageGenerator:
             # Store bill data for processing (we'll format in the drawing loop to include sponsor info)
             bill_data_list = bills_data
 
-            # Load fonts (regular and bold)
+            # Load fonts (regular, bold, italic, and emoji)
             try:
                 title_font = ImageFont.truetype("arial.ttf", title_font_size)
                 bill_font = ImageFont.truetype("arial.ttf", bill_font_size)
                 bold_font = ImageFont.truetype("arialbd.ttf", bill_font_size)  # Bold variant for bill numbers
+                italic_font = ImageFont.truetype("ariali.ttf", bill_font_size)  # Italic variant for introduced date
+                # Try to load emoji font (Segoe Color Emoji for Windows, Noto Color Emoji as fallback)
+                try:
+                    emoji_font = ImageFont.truetype("seguiemj.ttf", bill_font_size)  # Windows emoji font
+                except OSError:
+                    emoji_font = bill_font  # Fallback to regular font
                 is_default_font = False
-                LOG.info("Using truetype font (arial.ttf and arialbd.ttf)")
+                LOG.info("Using truetype font (arial.ttf, arialbd.ttf, ariali.ttf, and emoji font)")
             except OSError:
                 title_font = ImageFont.load_default()
                 bill_font = ImageFont.load_default()
                 bold_font = ImageFont.load_default()  # Fallback, no bold
+                italic_font = ImageFont.load_default()  # Fallback, no italic
+                emoji_font = ImageFont.load_default()  # Fallback, no emoji
                 is_default_font = True
                 LOG.warning("Fallback to default font - scaling disabled")
 
@@ -223,7 +231,15 @@ class XImageGenerator:
                 # Format text for wrapping calculations
                 title_text = f" - {title}" if title else ""
                 introduced_date = bill_data.get('introduced_date', 'Unknown')
-                sponsor_text = f"Sponsor: {sponsor} | Introduced: {introduced_date}"
+                
+                # Determine sponsor emoji based on party
+                sponsor_emoji = ""
+                if sponsor_party.upper() == 'D' or sponsor_party.upper() == 'DEMOCRAT':
+                    sponsor_emoji = "🫏 "  # Donkey for Democrats
+                elif sponsor_party.upper() == 'R' or sponsor_party.upper() == 'REPUBLICAN':
+                    sponsor_emoji = "🐘 "  # Elephant for Republicans
+                
+                sponsor_text = f"Sponsor: {sponsor_emoji}{sponsor} | Introduced: {introduced_date}"
 
                 # Compute the height of this bill entry (bill number + title + sponsor)
                 title_lines = self._wrap_text(title_text, max_line_width - draw.textbbox((0, 0), bill_number, font=bold_font)[2] - 10, bill_font, draw)
@@ -277,12 +293,74 @@ class XImageGenerator:
                     draw.text((x_pos if j == 0 else padding, current_line_y), line, fill='black', font=bill_font)
                     current_line_y += int(line_height * 1.5)
 
-                # Draw sponsor information
+                # Draw sponsor information with multiple fonts (bold + italic)
                 for j, line in enumerate(sponsor_lines):
                     if current_line_y + line_height > height - padding:
                         LOG.info(f"Insufficient space for sponsor lines in bill {i+1}")
                         break
-                    draw.text((padding, current_line_y), line, fill=sponsor_color, font=bill_font)
+                    
+                    # Parse and draw sponsor line with different fonts for different parts
+                    x_offset = padding
+                    
+                    # Check if this line contains the sponsor info
+                    if "Sponsor:" in line:
+                        # Draw "Sponsor: " in bold
+                        prefix = "Sponsor: "
+                        prefix_bbox = draw.textbbox((0, 0), prefix, font=bold_font)
+                        prefix_width = prefix_bbox[2] - prefix_bbox[0]
+                        draw.text((x_offset, current_line_y), prefix, fill=sponsor_color, font=bold_font)
+                        x_offset += prefix_width
+                        
+                        # Draw emoji + sponsor name (emoji in emoji font, name in regular font)
+                        remaining = line[len(prefix):]
+                        if " | Introduced:" in remaining:
+                            sponsor_part, date_part = remaining.split(" | Introduced: ", 1)
+                            
+                            # Split emoji from sponsor name (emoji is first character(s))
+                            emoji_end = 0
+                            for idx, char in enumerate(sponsor_part):
+                                if char in "🫏🐘":
+                                    emoji_end = idx + 1
+                                    break
+                            
+                            if emoji_end > 0:
+                                emoji = sponsor_part[:emoji_end]
+                                sponsor_name = sponsor_part[emoji_end:].lstrip()
+                                
+                                # Draw emoji with emoji font
+                                emoji_bbox = draw.textbbox((0, 0), emoji, font=emoji_font)
+                                emoji_width = emoji_bbox[2] - emoji_bbox[0]
+                                draw.text((x_offset, current_line_y), emoji, fill=sponsor_color, font=emoji_font)
+                                x_offset += emoji_width
+                                
+                                # Draw sponsor name in regular font (NOT bold)
+                                sponsor_bbox = draw.textbbox((0, 0), sponsor_name, font=bill_font)
+                                sponsor_width = sponsor_bbox[2] - sponsor_bbox[0]
+                                draw.text((x_offset, current_line_y), sponsor_name, fill=sponsor_color, font=bill_font)
+                                x_offset += sponsor_width
+                            else:
+                                # No emoji found, draw whole sponsor part in regular font
+                                sponsor_bbox = draw.textbbox((0, 0), sponsor_part, font=bill_font)
+                                sponsor_width = sponsor_bbox[2] - sponsor_bbox[0]
+                                draw.text((x_offset, current_line_y), sponsor_part, fill=sponsor_color, font=bill_font)
+                                x_offset += sponsor_width
+                            
+                            # Draw " | Introduced: " in bold
+                            introduced_prefix = " | Introduced: "
+                            intro_prefix_bbox = draw.textbbox((0, 0), introduced_prefix, font=bold_font)
+                            intro_prefix_width = intro_prefix_bbox[2] - intro_prefix_bbox[0]
+                            draw.text((x_offset, current_line_y), introduced_prefix, fill=sponsor_color, font=bold_font)
+                            x_offset += intro_prefix_width
+                            
+                            # Draw date in regular font
+                            draw.text((x_offset, current_line_y), date_part, fill=sponsor_color, font=bill_font)
+                        else:
+                            # Fallback if format doesn't match expected
+                            draw.text((x_offset, current_line_y), remaining, fill=sponsor_color, font=bill_font)
+                    else:
+                        # Regular sponsor lines without "Sponsor:" prefix
+                        draw.text((x_offset, current_line_y), line, fill=sponsor_color, font=bill_font)
+                    
                     current_line_y += int(line_height * 1.5)
 
                 y_position = current_line_y

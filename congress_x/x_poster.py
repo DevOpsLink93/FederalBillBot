@@ -266,10 +266,14 @@ class XPoster:
                             tweet_text = tweet_text[:277] + "..."
 
                         if media_ids:
+                            # X.com API has a maximum of 4 media items per tweet
+                            limited_media_ids = media_ids[:4]
+                            if len(media_ids) > 4:
+                                LOG.warning(f"⚠️  X.com supports max 4 media per tweet, limiting {len(media_ids)} images to 4")
                             # Create tweet with media IDs using v2 API (broader access)
-                            response = client.create_tweet(text=tweet_text, media_ids=media_ids)
+                            response = client.create_tweet(text=tweet_text, media_ids=limited_media_ids)
                             tweet_id = response.data['id']
-                            LOG.info(f"✅ Posted tweet with {len(media_ids)} images to X.com - Tweet ID: {tweet_id}")
+                            LOG.info(f"✅ Posted tweet with {len(limited_media_ids)} images to X.com - Tweet ID: {tweet_id}")
                             posted_count = 1
                         else:
                             # Create tweet without media using v2 API
@@ -481,14 +485,13 @@ class XPoster:
 
     def post_bills_as_thread(self, house_bills: list, senate_bills: list, post_to_x: bool = False, create_png: bool = False, png_filename_base: str = "federal_bills") -> tuple[int, bool]:
         """
-        Post bills as a thread: House bills in main post, Senate bills in reply thread.
+        Post House and Senate bills separately with independent threading.
         
-        Threading logic:
-        - If House bills exist: main post has House bills
-        - If Senate bills exist: reply thread continues with Senate bills
-        - If no House bills but Senate bills exist: Senate bills become main post
-        - If only House bills: post as single tweet (no thread)
-        - If no bills: don't post anything
+        Posting logic:
+        - Post House bills as separate tweet(s) with overflow images in threads
+        - Post Senate bills as separate tweet(s) with overflow images in threads
+        - Each chamber has its own main tweet and thread (if images > 4)
+        - No cross-chamber threading
         
         Args:
             house_bills: List of House bill data dictionaries
@@ -524,18 +527,7 @@ class XPoster:
                 LOG.info("No bills to post (neither House nor Senate)")
                 return 0, False
             
-            LOG.info(f"📌 Threaded posting: {len(house_bills)} House bills, {len(senate_bills)} Senate bills")
-            
-            # Determine main post and reply thread content
-            main_post_bills = house_bills if len(house_bills) > 0 else senate_bills
-            thread_reply_bills = senate_bills if len(house_bills) > 0 and len(senate_bills) > 0 else []
-            
-            main_post_label = "House Bills" if len(house_bills) > 0 else "Senate Bills"
-            is_thread = len(thread_reply_bills) > 0
-            
-            LOG.info(f"Main post: {main_post_label} ({len(main_post_bills)} bills)")
-            if is_thread:
-                LOG.info(f"Thread reply: Senate Bills ({len(thread_reply_bills)} bills)")
+            LOG.info(f"📌 Separate posting: {len(house_bills)} House bills, {len(senate_bills)} Senate bills")
             
             # Initialize API for posting
             client = None
@@ -556,131 +548,178 @@ class XPoster:
                     LOG.error(f"Failed to initialize X API: {e}")
                     return 0, False
             
-            # Create images for main post
-            main_post_image_paths = []
-            if create_png and main_post_bills:
-                LOG.info(f"Creating PNG images for main post ({main_post_label})...")
-                main_png_filename = f"{png_filename_base}-main.png"
-                main_post_image_paths = self.image_generator.create_multiple_bills_pngs(main_post_bills, main_png_filename)
-                if main_post_image_paths:
-                    LOG.info(f"✅ Created {len(main_post_image_paths)} image(s) for main post")
+            total_posted = 0
+            overall_success = True
             
-            # Post main tweet
+            # Process House bills if they exist
+            if house_bills:
+                LOG.info(f"📍 Processing {len(house_bills)} House bills...")
+                # Insert chamber suffix before file extension
+                name_parts = png_filename_base.rsplit('.', 1)
+                house_filename = f"{name_parts[0]}-house.{name_parts[1]}" if len(name_parts) > 1 else f"{png_filename_base}-house"
+                house_success = self._post_bills_chamber(
+                    house_bills, "House", 
+                    post_to_x, client, api, create_png,
+                    house_filename
+                )
+                if house_success:
+                    total_posted += len(house_bills)
+                else:
+                    overall_success = False
+            
+            # Process Senate bills if they exist
+            if senate_bills:
+                LOG.info(f"📍 Processing {len(senate_bills)} Senate bills...")
+                # Insert chamber suffix before file extension
+                name_parts = png_filename_base.rsplit('.', 1)
+                senate_filename = f"{name_parts[0]}-senate.{name_parts[1]}" if len(name_parts) > 1 else f"{png_filename_base}-senate"
+                senate_success = self._post_bills_chamber(
+                    senate_bills, "Senate",
+                    post_to_x, client, api, create_png,
+                    senate_filename
+                )
+            
+            LOG.info(f"✅ Separate posting complete - {total_posted} total bills posted")
+            return total_posted, overall_success
+            
+        except Exception as e:
+            LOG.error(f"Failed to post bills separately: {e}")
+            return 0, False
+
+    def _post_bills_chamber(self, bills: list, chamber_label: str, post_to_x: bool, client, api, create_png: bool, png_filename_base: str) -> bool:
+        """
+        Post bills for a single chamber (House or Senate) with threading for overflow images.
+        
+        Args:
+            bills: List of bill data dictionaries for this chamber
+            chamber_label: "House Bills" or "Senate Bills"
+            post_to_x: Whether to post to X.com
+            client: X API v2 client
+            api: X API v1.1 client
+            create_png: Whether to create PNG images
+            png_filename_base: Base filename for PNG images
+            
+        Returns:
+            True if posting was successful, False otherwise
+        """
+        try:
+            LOG.info(f"Starting {chamber_label} posting...")
+            
+            # Create images for this chamber
+            image_paths = []
+            if create_png and bills:
+                LOG.info(f"Creating PNG images for {chamber_label}...")
+                image_paths = self.image_generator.create_multiple_bills_pngs(bills, png_filename_base)
+                if image_paths:
+                    LOG.info(f"✅ Created {len(image_paths)} image(s) for {chamber_label}")
+            
+            # Post bills to .txt file
+            bills_text = "\n".join([self.format_bill_text(bill) for bill in bills])
+            self.append_to_txt_file(bills_text, add_new_post_indicator=False)
+            
+            # Post to X.com if enabled
             main_tweet_id = None
-            main_post_text = "\n".join([self.format_bill_text(bill) for bill in main_post_bills])
-            self.append_to_txt_file(main_post_text, add_new_post_indicator=False)
-            
-            if post_to_x and client and api:
+            if post_to_x and client and api and image_paths:
                 try:
                     # Upload main post images
                     main_media_ids = []
-                    for image_path in main_post_image_paths:
+                    for image_path in image_paths:
                         try:
-                            LOG.info(f"Uploading main post image: {image_path}")
+                            LOG.info(f"Uploading {chamber_label} image: {image_path}")
                             media = api.media_upload(image_path)
                             main_media_ids.append(str(media.media_id))
-                            LOG.info(f"✅ Uploaded main image - Media ID: {media.media_id}")
+                            LOG.info(f"✅ Uploaded {chamber_label} image - Media ID: {media.media_id}")
                         except Exception as e:
-                            LOG.warning(f"Failed to upload main image {image_path}: {e}")
+                            LOG.warning(f"Failed to upload {chamber_label} image {image_path}: {e}")
                     
                     # Create main post text
                     est_tz = timezone(timedelta(hours=-5))
                     est_time = datetime.now(est_tz)
                     date_str = est_time.strftime('%Y-%m-%d')
                     
-                    main_tweet_text = f"🚨 NEW {main_post_label.upper()} - Congress introduced {len(main_post_bills)} new bill(s) on {date_str}! 📋 View details in attached images."
+                    # Dynamic intro based on bill count
+                    if len(bills) <= 14:
+                        intro = f"🏛️ LATEST UPDATES: The {chamber_label.title()} introduced {len(bills)} new bills."
+                    else:
+                        intro = f"🚨 BUSY DAY ON THE HILL: A massive {len(bills)} new bills were just introduced in the {chamber_label.title()}!"
+                    
+                    # Combine with the standard footer
+                    main_tweet_text = f"{intro}\n\n📅 Date: {date_str}\n👇 See the breakdown in the attached images.\n🔗 Source: https://www.congress.gov/bills-with-chamber-action/browse-by-date"
+                    
                     if len(main_tweet_text) > 280:
                         main_tweet_text = main_tweet_text[:277] + "..."
                     
-                    # Post main tweet
+                    # Post main tweet (max 4 images)
+                    overflow_image_paths = []
                     if main_media_ids:
-                        response = client.create_tweet(text=main_tweet_text, media_ids=main_media_ids)
-                    else:
-                        response = client.create_tweet(text=main_tweet_text)
+                        limited_main_media_ids = main_media_ids[:4]
+                        
+                        if len(main_media_ids) > 4:
+                            LOG.warning(f"⚠️  X.com supports max 4 media per tweet, posting 4 in main tweet and {len(main_media_ids) - 4} in thread reply")
+                            overflow_image_paths = image_paths[4:]
+                        
+                        response = client.create_tweet(text=main_tweet_text, media_ids=limited_main_media_ids)
+                        main_tweet_id = response.data['id']
+                        LOG.info(f"✅ Posted main {chamber_label} tweet to X.com - Tweet ID: {main_tweet_id}")
                     
-                    main_tweet_id = response.data['id']
-                    LOG.info(f"✅ Posted main tweet to X.com - Tweet ID: {main_tweet_id}")
+                    # Post thread reply if there are overflow images
+                    if overflow_image_paths and main_tweet_id:
+                        LOG.info(f"Posting thread reply for {chamber_label} overflow images...")
+                        try:
+                            thread_media_ids = []
+                            for image_path in overflow_image_paths:
+                                try:
+                                    LOG.info(f"Uploading {chamber_label} thread image: {image_path}")
+                                    media = api.media_upload(image_path)
+                                    thread_media_ids.append(str(media.media_id))
+                                    LOG.info(f"✅ Uploaded {chamber_label} thread image - Media ID: {media.media_id}")
+                                except Exception as e:
+                                    LOG.warning(f"Failed to upload {chamber_label} thread image {image_path}: {e}")
+                            
+                            if thread_media_ids:
+                                thread_tweet_text = f"📋 {chamber_label} - Additional bill images (continuation)"
+                                if len(thread_tweet_text) > 280:
+                                    thread_tweet_text = thread_tweet_text[:277] + "..."
+                                
+                                limited_thread_media_ids = thread_media_ids[:4]
+                                if len(thread_media_ids) > 4:
+                                    LOG.warning(f"⚠️  Limiting thread reply to 4 media items")
+                                
+                                response = client.create_tweet(
+                                    text=thread_tweet_text,
+                                    reply_settings="mentionedUsers",
+                                    in_reply_to_tweet_id=main_tweet_id,
+                                    media_ids=limited_thread_media_ids
+                                )
+                                thread_tweet_id = response.data['id']
+                                LOG.info(f"✅ Posted {chamber_label} thread reply to X.com - Tweet ID: {thread_tweet_id}")
+                        
+                        except Exception as e:
+                            LOG.error(f"Failed to post {chamber_label} thread reply: {e}")
                     
+                    # Archive images
+                    if image_paths:
+                        LOG.info(f"🔄 Archiving {chamber_label} images...")
+                        self.image_generator.archive_images(image_paths)
+                
                 except Exception as e:
-                    LOG.error(f"Failed to post main tweet: {e}")
-                    return 0, False
-            
-            # Post thread reply (if there are Senate bills and House bills)
-            thread_post_successful = True
-            if is_thread:
-                thread_reply_image_paths = []
-                if create_png and thread_reply_bills:
-                    LOG.info(f"Creating PNG images for thread reply (Senate Bills)...")
-                    thread_png_filename = f"{png_filename_base}-thread.png"
-                    thread_reply_image_paths = self.image_generator.create_multiple_bills_pngs(thread_reply_bills, thread_png_filename)
-                    if thread_reply_image_paths:
-                        LOG.info(f"✅ Created {len(thread_reply_image_paths)} image(s) for thread reply")
-                
-                # Append thread reply to txt file
-                thread_reply_text = "\n".join([self.format_bill_text(bill) for bill in thread_reply_bills])
-                self.append_to_txt_file(f"[THREAD REPLY]\n{thread_reply_text}", add_new_post_indicator=False)
-                
-                if post_to_x and client and api and main_tweet_id:
-                    try:
-                        # Upload thread images
-                        thread_media_ids = []
-                        for image_path in thread_reply_image_paths:
-                            try:
-                                LOG.info(f"Uploading thread image: {image_path}")
-                                media = api.media_upload(image_path)
-                                thread_media_ids.append(str(media.media_id))
-                                LOG.info(f"✅ Uploaded thread image - Media ID: {media.media_id}")
-                            except Exception as e:
-                                LOG.warning(f"Failed to upload thread image {image_path}: {e}")
-                        
-                        # Create thread reply text
-                        thread_tweet_text = f"📊 SENATE BILLS - Continuing thread: {len(thread_reply_bills)} Senate bill(s) introduced. See details in attached images."
-                        if len(thread_tweet_text) > 280:
-                            thread_tweet_text = thread_tweet_text[:277] + "..."
-                        
-                        # Post thread reply (reply_settings excludes non-followers from replying)
-                        if thread_media_ids:
-                            response = client.create_tweet(text=thread_tweet_text, reply_settings="mentionedUsers", in_reply_to_tweet_id=main_tweet_id, media_ids=thread_media_ids)
-                        else:
-                            response = client.create_tweet(text=thread_tweet_text, reply_settings="mentionedUsers", in_reply_to_tweet_id=main_tweet_id)
-                        
-                        thread_tweet_id = response.data['id']
-                        LOG.info(f"✅ Posted thread reply to X.com - Tweet ID: {thread_tweet_id}")
-                        
-                    except Exception as e:
-                        LOG.error(f"Failed to post thread reply: {e}")
-                        thread_post_successful = False
-                
-                # Archive thread images if posting successful
-                if thread_post_successful and thread_reply_image_paths:
-                    LOG.info("🔄 Archiving thread reply images...")
-                    self.image_generator.archive_images(thread_reply_image_paths)
+                    LOG.error(f"Failed to post {chamber_label} to X: {e}")
+                    return False
             
             # Store all bills in database
-            LOG.info("Saving all bills to database...")
+            LOG.info(f"Saving {chamber_label} to database...")
             bills_saved = 0
-            for bill_data in main_post_bills + thread_reply_bills:
+            for bill_data in bills:
                 try:
                     was_stored = self.store_in_database(bill_data)
                     if was_stored:
                         bills_saved += 1
                 except Exception as e:
-                    LOG.error(f"Failed to store bill {bill_data.get('formatted_bill_number', 'Unknown')}: {e}")
+                    LOG.warning(f"Failed to store bill in database: {e}")
             
-            LOG.info(f"✅ Successfully saved {bills_saved} bills to database")
+            LOG.info(f"✅ Successfully saved {bills_saved} out of {len(bills)} {chamber_label.lower()} to database")
+            return True
             
-            # Archive main post images if posting successful
-            posting_successful = (main_tweet_id is not None) if post_to_x else True
-            if posting_successful and main_post_image_paths:
-                LOG.info("🔄 Archiving main post images...")
-                self.image_generator.archive_images(main_post_image_paths)
-            
-            # Final summary
-            thread_summary = " (threaded with Senate bills)" if is_thread else " (single post)"
-            LOG.info(f"✅ Threaded posting complete - {total_bills} bills posted{thread_summary}")
-            
-            return total_bills, posting_successful and thread_post_successful
-
         except Exception as e:
-            LOG.error(f"Failed to post bills as thread: {e}")
-            return 0, False
+            LOG.error(f"Failed to post {chamber_label}: {e}")
+            return False
