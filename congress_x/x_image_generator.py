@@ -109,7 +109,29 @@ class XImageGenerator:
             # Create title
             est_tz = timezone(timedelta(hours=-5))  # EST is UTC-5
             est_time = datetime.now(est_tz)
-            title = f"@FedBillAlert Summary - {est_time.strftime('%Y-%m-%d %I:%M %p EST')}"
+            
+            # Determine chamber (House, Senate, or Mixed)
+            chamber = None
+            house_count = 0
+            senate_count = 0
+            for bill in bills_data:
+                bill_number = bill.get('formatted_bill_number', '')
+                if bill_number.startswith('H.'):
+                    house_count += 1
+                elif bill_number.startswith('S.'):
+                    senate_count += 1
+            
+            if house_count > 0 and senate_count == 0:
+                chamber = "House"
+            elif senate_count > 0 and house_count == 0:
+                chamber = "Senate"
+            
+            # Format title with chamber if applicable
+            if chamber:
+                title = f"@FedBillAlert {chamber} Summary - {est_time.strftime('%Y-%m-%d %I:%M %p EST')} �"
+            else:
+                title = f"@FedBillAlert Summary - {est_time.strftime('%Y-%m-%d %I:%M %p EST')} 📄"
+            
             if total_images and total_images > 1 and image_num:
                 title += f" (Part {image_num} of {total_images}: {len(bills_data)} bills)"
             else:
@@ -120,7 +142,7 @@ class XImageGenerator:
 
             # Load fonts (regular, bold, italic, and emoji)
             try:
-                title_font = ImageFont.truetype("arial.ttf", title_font_size)
+                title_font = ImageFont.truetype("arialbd.ttf", title_font_size)  # Bold title font
                 bill_font = ImageFont.truetype("arial.ttf", bill_font_size)
                 bold_font = ImageFont.truetype("arialbd.ttf", bill_font_size)  # Bold variant for bill numbers
                 italic_font = ImageFont.truetype("ariali.ttf", bill_font_size)  # Italic variant for introduced date
@@ -207,8 +229,8 @@ class XImageGenerator:
                     total_bill_height = compute_total_bill_height(bill_data_list, bill_font, bold_font, line_height)
                     LOG.info(f"Further scaled bill font to {new_bill_font_size}pt to fit content")
 
-            # Create image with fixed 16:9 dimensions and light gray background
-            image = Image.new('RGB', (width, height), color=(245, 245, 245))
+            # Create image with fixed 16:9 dimensions and light background (#FAFAFA)
+            image = Image.new('RGB', (width, height), color=(250, 250, 250))
             draw = ImageDraw.Draw(image)
 
             # Draw title centered
@@ -216,6 +238,10 @@ class XImageGenerator:
             title_width = title_bbox[2] - title_bbox[0]
             title_x = (width - title_width) // 2
             draw.text((title_x, padding), title, fill='black', font=title_font)
+
+            # Draw horizontal line below title
+            line_y = padding + title_height + margin_after_title - 15
+            draw.line([(padding, line_y), (width - padding, line_y)], fill='black', width=3)
 
             # Start position for bills
             y_position = padding + title_height + margin_after_title
@@ -235,11 +261,11 @@ class XImageGenerator:
                 # Determine sponsor emoji based on party
                 sponsor_emoji = ""
                 if sponsor_party.upper() == 'D' or sponsor_party.upper() == 'DEMOCRAT':
-                    sponsor_emoji = "🫏 "  # Donkey for Democrats
+                    sponsor_emoji = " 🫏"  # Donkey for Democrats
                 elif sponsor_party.upper() == 'R' or sponsor_party.upper() == 'REPUBLICAN':
-                    sponsor_emoji = "🐘 "  # Elephant for Republicans
+                    sponsor_emoji = " 🐘"  # Elephant for Republicans
                 
-                sponsor_text = f"Sponsor: {sponsor_emoji}{sponsor} | Introduced: {introduced_date}"
+                sponsor_text = f"Sponsor: {sponsor}{sponsor_emoji} | Introduced: {introduced_date}"
 
                 # Compute the height of this bill entry (bill number + title + sponsor)
                 title_lines = self._wrap_text(title_text, max_line_width - draw.textbbox((0, 0), bill_number, font=bold_font)[2] - 10, bill_font, draw)

@@ -398,6 +398,7 @@ class XPoster:
             max_images_per_tweet = 4
             tweets_posted = 0
             total_images = len(image_paths)
+            main_tweet_id = None  # Track the first tweet for threading replies
 
             for tweet_idx in range(0, total_images, max_images_per_tweet):
                 try:
@@ -432,7 +433,10 @@ class XPoster:
                     # Create tweet text for this batch of images
                     images_shown = sum(10 for _ in image_chunk)  # Approximate bills shown
                     if total_chunks > 1:
-                        tweet_text = f"Introduced Legislation - {date_str} {time_str} EST. Tweet {chunk_num} of {total_chunks}. See images for bill details or visit https://tinyurl.com/recentbills"
+                        if chunk_num == 1:
+                            tweet_text = f"Introduced Legislation - {date_str} {time_str} EST. Tweet {chunk_num} of {total_chunks}. See images for bill details or visit https://tinyurl.com/recentbills"
+                        else:
+                            tweet_text = f"📋 Continuation: Tweet {chunk_num} of {total_chunks}. See images for additional bill details or visit https://tinyurl.com/recentbills"
                     else:
                         tweet_text = f"Introduced Legislation - {date_str} {time_str} EST. {total_images} image(s) with bill details. Visit https://tinyurl.com/recentbills"
 
@@ -442,7 +446,20 @@ class XPoster:
 
                     # Post tweet with images
                     try:
-                        response = client.create_tweet(text=tweet_text, media_ids=media_ids)
+                        # If this is not the first tweet and we have more than 1 chunk, reply to the main tweet
+                        if chunk_num > 1 and main_tweet_id:
+                            LOG.info(f"Posting tweet {chunk_num} as reply to main tweet {main_tweet_id}...")
+                            response = client.create_tweet(
+                                text=tweet_text, 
+                                media_ids=media_ids,
+                                in_reply_to_tweet_id=main_tweet_id,
+                                reply_settings="mentionedUsers"
+                            )
+                        else:
+                            # First tweet
+                            response = client.create_tweet(text=tweet_text, media_ids=media_ids)
+                            main_tweet_id = response.data['id']  # Store the ID for threading
+                        
                         tweet_id = response.data['id']
                         LOG.info(f"✅ Posted tweet {chunk_num}/{total_chunks} with {len(media_ids)} image(s) to X.com - Tweet ID: {tweet_id}")
                         tweets_posted += 1
