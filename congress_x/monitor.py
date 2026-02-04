@@ -64,9 +64,9 @@ def get_dynamic_start_number(bill_type: str, fallback_start: int) -> int:
 
         if result and result[0]:
             highest_db_bill = int(result[0])
-            # Start 300 numbers higher than the highest in database to catch new bills
-            # (This handles cases where many bills are introduced in a session)
-            dynamic_start = highest_db_bill + 300
+            # Start 100 numbers higher than the highest in database to catch new bills
+            # (Scans the next 100 bills in the House or Senate)
+            dynamic_start = highest_db_bill + 100
             LOG.info(f"Using dynamic start for {bill_type} bills: {dynamic_start} (highest in DB: {highest_db_bill})")
             return dynamic_start
         else:
@@ -79,7 +79,7 @@ def get_dynamic_start_number(bill_type: str, fallback_start: int) -> int:
         return fallback_start
 
 
-def fetch_recent_bills(api_key: str, limit: int = 250, days_back: int = 7) -> List[Dict[str, Any]]:
+def fetch_recent_bills(api_key: str, limit: int = 250, days_back: int = 7, verbose_logging: bool = False) -> List[Dict[str, Any]]:
     """
     Fetch bills from congress.gov API for the 119th Congress that were introduced
     within the last N days using date filtering.
@@ -88,6 +88,7 @@ def fetch_recent_bills(api_key: str, limit: int = 250, days_back: int = 7) -> Li
         api_key: Congress API key
         limit: Maximum number of bills to fetch from API (default 250)
         days_back: Number of days to look back from today (default 7)
+        verbose_logging: Enable verbose logging to track all bills (default False)
 
     Returns:
         List of bill dictionaries from the 119th Congress introduced in the date range,
@@ -105,6 +106,8 @@ def fetch_recent_bills(api_key: str, limit: int = 250, days_back: int = 7) -> Li
 
     try:
         LOG.info(f"Fetching bills from 119th Congress introduced between {from_date} and {today}...")
+        if verbose_logging:
+            LOG.info("📊 VERBOSE MODE: Tracking all bills discovered")
 
         all_bills = []
 
@@ -129,10 +132,18 @@ def fetch_recent_bills(api_key: str, limit: int = 250, days_back: int = 7) -> Li
                     actions = get_bill_actions(api_key, "119", bill_type, str(bill_num))
                     intro_action = find_introduction_action(actions)
 
+                    # Use intro_action if found, or fallback to introducedDate in bill_detail
+                    intro_date_str = None
+                    
                     if intro_action and intro_action.get("actionDate"):
-                        introduced_date_str = intro_action.get("actionDate")
+                        intro_date_str = intro_action.get("actionDate")
+                    elif bill_detail and bill_detail.get("introducedDate"):
+                        # Fallback to introducedDate from bill_detail
+                        intro_date_str = bill_detail.get("introducedDate")
+                    
+                    if intro_date_str:
                         try:
-                            introduced_date = datetime.fromisoformat(introduced_date_str.replace('Z', '+00:00')).date()
+                            introduced_date = datetime.fromisoformat(intro_date_str.replace('Z', '+00:00')).date()
                             if from_date <= introduced_date <= today:
                                 # Create bill data
                                 bill = {
@@ -141,11 +152,14 @@ def fetch_recent_bills(api_key: str, limit: int = 250, days_back: int = 7) -> Li
                                     "congress": "119",
                                     "title": bill_detail.get("title", "")
                                 }
-                                bill_data = extract_bill_data(bill, bill_detail, intro_action)
+                                bill_data = extract_bill_data(bill, bill_detail, intro_action if intro_action else {})
                                 all_bills.append(bill_data)
                                 hr_bills_found += 1
                                 consecutive_not_found = 0  # Reset counter
-                                LOG.debug(f"Found recent HR bill: {bill_type.upper()}.{bill_num} introduced on {introduced_date} (via {intro_action.get('type')} action)")
+                                if verbose_logging:
+                                    LOG.info(f"🔍 HR Bill Found: {bill_type.upper()}.{bill_num} - '{bill_detail.get('title', 'Unknown')}' (Introduced: {introduced_date})")
+                                else:
+                                    LOG.debug(f"Found recent HR bill: {bill_type.upper()}.{bill_num} introduced on {introduced_date}")
                             elif introduced_date < from_date:
                                 # Bill is too old, we can stop going backwards
                                 LOG.debug(f"Bill {bill_type.upper()}.{bill_num} is too old ({introduced_date}), stopping HR search")
@@ -153,8 +167,8 @@ def fetch_recent_bills(api_key: str, limit: int = 250, days_back: int = 7) -> Li
                         except (ValueError, TypeError) as e:
                             LOG.debug(f"Could not parse date for {bill_type.upper()}.{bill_num}: {e}")
                     else:
-                        # Bill has no intro action - log but continue searching (don't count against consecutive_not_found)
-                        LOG.debug(f"Bill {bill_type.upper()}.{bill_num} has no IntroReferral action, continuing search")
+                        # Bill has no intro action and no introducedDate - log but continue searching
+                        LOG.debug(f"Bill {bill_type.upper()}.{bill_num} has no introduction date, continuing search")
                 else:
                     # Bill details not found - this could be a bill that doesn't exist yet
                     # Don't count this as consecutive_not_found, just skip and continue
@@ -180,32 +194,57 @@ def fetch_recent_bills(api_key: str, limit: int = 250, days_back: int = 7) -> Li
         for bill_type in senate_bill_types:
             senate_bills_found = 0
             consecutive_not_found = 0
-            max_consecutive_not_found = 20
+            max_consecutive_not_found = 15  # Reduced from 20 for more thorough searching
 
             # Different starting points for different bill types
             if bill_type == "s":
-                start_num = get_dynamic_start_number("S", 500)  # Senate bills - increased fallback
+                start_num = get_dynamic_start_number("S", 600)  # Senate bills - increased fallback to 600
             elif bill_type == "sres":
-                start_num = get_dynamic_start_number("SRES", 300)  # Senate simple resolutions - increased fallback
+                start_num = get_dynamic_start_number("SRES", 400)  # Senate simple resolutions - increased fallback
             elif bill_type == "sjres":
-                start_num = get_dynamic_start_number("SJRES", 300)  # Senate joint resolutions - increased fallback
+                start_num = get_dynamic_start_number("SJRES", 400)  # Senate joint resolutions - increased fallback
             elif bill_type == "sconres":
-                start_num = get_dynamic_start_number("SCONRES", 100)  # Senate concurrent resolutions - increased fallback
+                start_num = get_dynamic_start_number("SCONRES", 200)  # Senate concurrent resolutions - increased fallback
             else:
-                start_num = 100   # Fallback
+                start_num = 200   # Fallback
+
+            if verbose_logging:
+                LOG.info(f"Searching {bill_type.upper()} bills from {start_num} down to 0...")
 
             for bill_num in range(start_num, 0, -1):
                 try:
+                    # Special debugging for S.3755
+                    debug_this_bill = (bill_type == "s" and bill_num == 3755)
+                    
                     bill_detail = get_bill_details(api_key, "119", bill_type, str(bill_num), log_errors=False)
                     if bill_detail:
                         # Get bill actions to find introduction date
                         actions = get_bill_actions(api_key, "119", bill_type, str(bill_num))
                         intro_action = find_introduction_action(actions)
 
+                        if debug_this_bill:
+                            LOG.info(f"🔍 DEBUG S.3755: Found bill_detail, got {len(actions)} actions, intro_action={intro_action}")
+
+                        # Use intro_action if found, or fallback to introducedDate in bill_detail
+                        intro_date_str = None
+                        used_fallback = False
+                        
                         if intro_action and intro_action.get("actionDate"):
-                            introduced_date_str = intro_action.get("actionDate")
+                            intro_date_str = intro_action.get("actionDate")
+                        elif bill_detail and bill_detail.get("introducedDate"):
+                            # Fallback to introducedDate from bill_detail
+                            intro_date_str = bill_detail.get("introducedDate")
+                            used_fallback = True
+                            if debug_this_bill:
+                                LOG.info(f"🔍 DEBUG S.3755: Using fallback introducedDate from bill_detail: {intro_date_str}")
+                        
+                        if intro_date_str:
                             try:
-                                introduced_date = datetime.fromisoformat(introduced_date_str.replace('Z', '+00:00')).date()
+                                introduced_date = datetime.fromisoformat(intro_date_str.replace('Z', '+00:00')).date()
+                                
+                                if debug_this_bill:
+                                    LOG.info(f"🔍 DEBUG S.3755: Parsed date={introduced_date}, from_date={from_date}, today={today}, in_range={from_date <= introduced_date <= today}")
+                                
                                 if from_date <= introduced_date <= today:
                                     # Create bill data
                                     bill = {
@@ -214,32 +253,60 @@ def fetch_recent_bills(api_key: str, limit: int = 250, days_back: int = 7) -> Li
                                         "congress": "119",
                                         "title": bill_detail.get("title", "")
                                     }
-                                    bill_data = extract_bill_data(bill, bill_detail, intro_action)
+                                    bill_data = extract_bill_data(bill, bill_detail, intro_action if intro_action else {})
                                     all_bills.append(bill_data)
                                     senate_bills_found += 1
-                                    consecutive_not_found = 0
-                                    LOG.debug(f"Found recent Senate bill: {bill_type.upper()}.{bill_num} introduced on {introduced_date} (via {intro_action.get('type')} action)")
+                                    consecutive_not_found = 0  # Reset counter
+                                    if verbose_logging:
+                                        fallback_str = " (from bill_detail)" if used_fallback else ""
+                                        LOG.info(f"🔍 Senate Bill Found: {bill_type.upper()}.{bill_num} - '{bill_detail.get('title', 'Unknown')}' (Introduced: {introduced_date}){fallback_str}")
+                                    else:
+                                        LOG.debug(f"Found recent Senate bill: {bill_type.upper()}.{bill_num} introduced on {introduced_date}")
                                 elif introduced_date < from_date:
                                     # Too old, stop searching this type
+                                    if debug_this_bill:
+                                        LOG.info(f"🔍 DEBUG S.3755: Bill is too old ({introduced_date} < {from_date}), stopping search")
+                                    LOG.debug(f"Bill {bill_type.upper()}.{bill_num} is too old ({introduced_date}), stopping {bill_type.upper()} search")
                                     break
                             except (ValueError, TypeError) as e:
+                                if debug_this_bill:
+                                    LOG.info(f"🔍 DEBUG S.3755: Date parsing error: {e}")
                                 LOG.debug(f"Could not parse date for {bill_type.upper()}.{bill_num}: {e}")
                         else:
-                            # Bill has no intro action - log but continue searching (don't count against consecutive_not_found)
-                            LOG.debug(f"Bill {bill_type.upper()}.{bill_num} has no IntroReferral action, continuing search")
+                            # Bill has no intro action and no introducedDate - log but continue searching
+                            if debug_this_bill:
+                                LOG.info(f"🔍 DEBUG S.3755: No intro_action and no introducedDate found")
+                            LOG.debug(f"Bill {bill_type.upper()}.{bill_num} has no introduction date, continuing search")
                     else:
-                        # Bill details not found - this could be a bill that doesn't exist yet
-                        # Don't count this as consecutive_not_found, just skip and continue
-                        LOG.debug(f"Bill {bill_type.upper()}.{bill_num} not found (may not exist yet), continuing search")
+                        # Bill details not found - don't count against consecutive_not_found
+                        if debug_this_bill:
+                            LOG.info(f"🔍 DEBUG S.3755: bill_detail is None (404 or not found)")
+                        LOG.debug(f"Bill {bill_type.upper()}.{bill_num} not found, continuing search")
+                        consecutive_not_found += 1
+                        if consecutive_not_found >= max_consecutive_not_found:
+                            LOG.debug(f"Found {max_consecutive_not_found} consecutive missing {bill_type.upper()} bills, stopping {bill_type.upper()} search")
+                            break
                         continue
                 except Exception as e:
                     # Check if it's a 404 (bill doesn't exist) - this is expected when searching high numbers
                     if "404" in str(e):
-                        LOG.debug(f"Bill {bill_type.upper()}.{bill_num} does not exist (404), continuing search")
+                        if debug_this_bill:
+                            LOG.info(f"🔍 DEBUG S.3755: Got 404 exception: {e}")
+                        LOG.debug(f"Bill {bill_type.upper()}.{bill_num} does not exist (404)")
+                        consecutive_not_found += 1
+                        if consecutive_not_found >= max_consecutive_not_found:
+                            LOG.debug(f"Found {max_consecutive_not_found} consecutive 404s for {bill_type.upper()} bills, stopping search")
+                            break
                         continue
                     else:
-                        # Other error - log as warning and continue searching
-                        LOG.warning(f"Error checking bill: {e}")
+                        # Other error - log as warning and count as consecutive not found
+                        if debug_this_bill:
+                            LOG.info(f"🔍 DEBUG S.3755: Got other exception: {e}")
+                        LOG.warning(f"Error checking {bill_type.upper()} bill {bill_num}: {e}")
+                        consecutive_not_found += 1
+                        if consecutive_not_found >= max_consecutive_not_found:
+                            LOG.debug(f"Found {max_consecutive_not_found} consecutive errors, stopping {bill_type.upper()} search")
+                            break
                         continue
 
         # Check other bill types (HJRES, HRES, HCONRES) - use efficient search
@@ -269,10 +336,18 @@ def fetch_recent_bills(api_key: str, limit: int = 250, days_back: int = 7) -> Li
                         actions = get_bill_actions(api_key, "119", bill_type, str(bill_num))
                         intro_action = find_introduction_action(actions)
 
+                        # Use intro_action if found, or fallback to introducedDate in bill_detail
+                        intro_date_str = None
+                        
                         if intro_action and intro_action.get("actionDate"):
-                            introduced_date_str = intro_action.get("actionDate")
+                            intro_date_str = intro_action.get("actionDate")
+                        elif bill_detail and bill_detail.get("introducedDate"):
+                            # Fallback to introducedDate from bill_detail
+                            intro_date_str = bill_detail.get("introducedDate")
+                        
+                        if intro_date_str:
                             try:
-                                introduced_date = datetime.fromisoformat(introduced_date_str.replace('Z', '+00:00')).date()
+                                introduced_date = datetime.fromisoformat(intro_date_str.replace('Z', '+00:00')).date()
                                 if from_date <= introduced_date <= today:
                                     # Create bill data
                                     bill = {
@@ -281,11 +356,11 @@ def fetch_recent_bills(api_key: str, limit: int = 250, days_back: int = 7) -> Li
                                         "congress": "119",
                                         "title": bill_detail.get("title", "")
                                     }
-                                    bill_data = extract_bill_data(bill, bill_detail, intro_action)
+                                    bill_data = extract_bill_data(bill, bill_detail, intro_action if intro_action else {})
                                     all_bills.append(bill_data)
                                     other_bills_found += 1
                                     consecutive_not_found = 0
-                                    LOG.debug(f"Found recent {bill_type.upper()} bill: {bill_type.upper()}.{bill_num} introduced on {introduced_date} (via {intro_action.get('type')} action)")
+                                    LOG.debug(f"Found recent {bill_type.upper()} bill: {bill_type.upper()}.{bill_num} introduced on {introduced_date}")
                                 elif introduced_date < from_date:
                                     # Too old, stop searching this type
                                     break
@@ -341,6 +416,12 @@ def fetch_recent_bills(api_key: str, limit: int = 250, days_back: int = 7) -> Li
         session.close()
 
         LOG.info(f"Successfully fetched {len(bills_batch)} bills introduced between {from_date} and {today}")
+        if verbose_logging:
+            LOG.info(f"📊 Bill Summary: Total discovered = {len(bills_batch)}")
+            for bill in bills_batch:
+                bill_type = bill.get("bill_type", "UNKNOWN")
+                bill_num = bill.get("bill_number", "?")
+                LOG.info(f"   - {bill_type}.{bill_num}")
         return bills_batch
 
     except Exception as e:
@@ -406,7 +487,7 @@ def find_introduction_action(actions: List[Dict[str, Any]]) -> Dict[str, Any]:
     Find the bill introduction action from the list of actions.
     Prioritizes actions with Type: "IntroReferral" and official introduction codes:
     - House: Code "1000" (numeric), "1025" (resolutions), or "Intro-H" (alphabetic)
-    - Senate: Code "10000" (numeric) or "Intro-S" (alphabetic)
+    - Senate: Code "10000" (numeric), "17000" (Senate resolutions), or "Intro-S" (alphabetic)
     Falls back to any "IntroReferral" action if specific codes aren't found.
     Returns the EARLIEST (oldest) matching action to get the actual introduction date.
 
@@ -417,13 +498,22 @@ def find_introduction_action(actions: List[Dict[str, Any]]) -> Dict[str, Any]:
         Introduction action dictionary or empty dict if not found
     """
     # Priority 1: Look for actions with Type="IntroReferral" AND specific introduction codes
-    introduction_codes = ["1000", "10000", "1025", "Intro-H", "Intro-S"]
+    # Code 17000 is for Senate resolutions (SRES, SJRES, SCONRES)
+    introduction_codes = ["1000", "10000", "1025", "17000", "Intro-H", "Intro-S"]
     priority_actions = []
     for action in actions:
         action_type = action.get("type", "")
         action_code = action.get("actionCode", "")
         if action_type == "IntroReferral" and action_code in introduction_codes:
             priority_actions.append(action)
+    
+    # Priority 1b: Also check for Floor actions with code 17000 (Senate resolutions)
+    if not priority_actions:
+        for action in actions:
+            action_type = action.get("type", "")
+            action_code = action.get("actionCode", "")
+            if action_type == "Floor" and action_code == "17000":
+                priority_actions.append(action)
 
     if priority_actions:
         # Sort by date (oldest first) and return the earliest
@@ -614,16 +704,24 @@ def countdown_timer(seconds: int, message: str = "Next scan in") -> None:
     print("🚀 Starting next scan...\n")
 
 
-def monitor_and_process_bills(api_key: str, limit: int = 50, post_to_x: bool = False, aggregate_all: bool = False) -> tuple[int, bool]:
+def monitor_and_process_bills(api_key: str, limit: int = 50, post_to_x: bool = False, aggregate_all: bool = False, verbose_logging: bool = False) -> tuple[int, bool]:
     """
     Main monitoring function that fetches recent bills and processes them.
-    Can process all bills from scan or only new ones.
+    Separates bills by type (House vs Senate) and posts them as a thread.
+    
+    Threading logic:
+    - House bills in main post (if any)
+    - Senate bills in reply thread (if any and House bills exist)
+    - Senate bills as main post (if no House bills)
+    - Single post (if only House bills)
+    - No post (if no bills)
 
     Args:
         api_key: Congress API key
         limit: Number of bills to fetch (default 50)
         post_to_x: Whether to post bills to X.com (default False)
         aggregate_all: Whether to aggregate ALL bills from scan (default False)
+        verbose_logging: Enable verbose logging to track all operations (default False)
 
     Returns:
         Tuple of (number of bills processed, whether posting to X occurred)
@@ -631,21 +729,30 @@ def monitor_and_process_bills(api_key: str, limit: int = 50, post_to_x: bool = F
     LOG.info(f"🔍 Starting bill monitoring - fetching bills introduced in the last 7 days")
 
     # Use larger limit to capture all bills in the date range
-    # We'll prioritize HR bills and sort them by number descending
-    bills = fetch_recent_bills(api_key, limit=250, days_back=7)
+    bills = fetch_recent_bills(api_key, limit=250, days_back=7, verbose_logging=verbose_logging)
+    
     if not bills:
         LOG.warning("No bills fetched from API")
         return 0, False
 
+    if verbose_logging:
+        LOG.info(f"📈 API returned {len(bills)} total bills for the date range")
+
     # Initialize XPoster for processing
     poster = XPoster()
-    bills_to_process = []
+    house_bills_to_process = []
+    senate_bills_to_process = []
+    
+    # Track skipped bills for detailed logging
+    skipped_existing = []
+    skipped_invalid = []
 
-    # Collect bills based on aggregation mode
+    # Collect and separate bills by type
     for bill in bills:
         # Ensure bill is a dictionary
         if not isinstance(bill, dict):
             LOG.warning(f"Skipping invalid bill object (not a dict): {type(bill)}")
+            skipped_invalid.append(str(bill))
             continue
 
         bill_type = bill.get("bill_type", "").upper()
@@ -655,6 +762,7 @@ def monitor_and_process_bills(api_key: str, limit: int = 50, post_to_x: bool = F
         # Skip if missing required fields
         if not all([bill_type, bill_number, congress]):
             LOG.debug(f"Skipping bill with missing required fields: {bill}")
+            skipped_invalid.append(f"{bill_type}.{bill_number}")
             continue
 
         LOG.debug(f"Processing bill {bill_type}.{bill_number} (Congress {congress})")
@@ -664,46 +772,77 @@ def monitor_and_process_bills(api_key: str, limit: int = 50, post_to_x: bool = F
             try:
                 exists = bill_exists(init_db_connection(), congress, bill_number, bill_type)
                 if exists:
-                    LOG.info(f"⏭️ Bill {bill_type}.{bill_number} already exists in database - skipping")
+                    skipped_existing.append(f"{bill_type}.{bill_number}")
+                    if verbose_logging:
+                        LOG.info(f"⏭️  [EXISTING] Bill {bill_type}.{bill_number} already in database - skipping")
+                    else:
+                        LOG.debug(f"Bill {bill_type}.{bill_number} already exists in database - skipping")
                     continue
             except Exception as e:
                 LOG.error(f"Database check failed for bill {bill_type}.{bill_number}: {e}")
                 continue
         else:
-            LOG.debug(f"📊 Aggregating all bills mode - including {bill_type}.{bill_number} regardless of database status")
+            if verbose_logging:
+                LOG.info(f"📊 [NEW] Aggregating bill {bill_type}.{bill_number} (aggregate_all mode)")
 
         # Get detailed information for the bill
         LOG.info(f"📋 Bill discovered: {bill_type}.{bill_number} (Congress {congress})")
         bill_detail = get_bill_details(api_key, congress, bill_type.lower(), bill_number)
         bill_data = extract_bill_data(bill, bill_detail)
-        bills_to_process.append(bill_data)
+        
+        # Separate bills by chamber
+        # House bills: HR, HRES, HJRES, HCONRES
+        # Senate bills: S, SRES, SJRES, SCONRES
+        if bill_type.startswith("H"):
+            house_bills_to_process.append(bill_data)
+        elif bill_type.startswith("S"):
+            senate_bills_to_process.append(bill_data)
 
-    # Process bills into posts and store in database
-    if bills_to_process:
+    # Process bills with threaded posting
+    if house_bills_to_process or senate_bills_to_process:
         try:
-            # Choose PNG filename based on mode and create timestamped name
+            # Create timestamped filename base
             from datetime import datetime
             timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            png_basename = f"fedbillsummary-{timestamp}.png"
-            png_filename = os.path.join(os.path.dirname(__file__), "..", "summary_images", png_basename)
-            processed_count, x_posting_successful = poster.process_bills_into_posts(bills_to_process, post_to_x=post_to_x, create_png=True, png_filename=png_filename)
+            png_filename_base = os.path.join(os.path.dirname(__file__), "..", "summary_images", f"fedbillsummary-{timestamp}.png")
+            
+            # Use threaded posting function
+            processed_count, x_posting_successful = poster.post_bills_as_thread(
+                house_bills=house_bills_to_process,
+                senate_bills=senate_bills_to_process,
+                post_to_x=post_to_x,
+                create_png=True,
+                png_filename_base=png_filename_base
+            )
             posting_occurred = x_posting_successful
-            if aggregate_all:
-                LOG.info(f"✅ Successfully aggregated {processed_count} bills and created PNG image")
-            elif post_to_x:
-                LOG.info(f"✅ Successfully processed {processed_count} bills into posts and posted to X.com")
+            
+            if post_to_x:
+                LOG.info(f"✅ Successfully processed {processed_count} bills into threaded posts and posted to X.com")
             else:
-                LOG.info(f"✅ Successfully processed {processed_count} bills into posts and created PNG image")
+                LOG.info(f"✅ Successfully processed {processed_count} bills into PNG images and text records")
         except Exception as e:
-            LOG.error(f"Failed to process bills into posts: {e}")
+            LOG.error(f"Failed to process bills with threading: {e}")
             return 0, False
     else:
-        if aggregate_all:
-            LOG.info("No bills to aggregate")
-        else:
-            LOG.info("No new bills to process")
+        LOG.info("No new bills to process")
         processed_count = 0
         posting_occurred = False
+
+    # Print summary statistics
+    if verbose_logging:
+        LOG.info("=" * 60)
+        LOG.info("📊 PROCESSING SUMMARY:")
+        LOG.info(f"   Total bills from API: {len(bills)}")
+        LOG.info(f"   Bills processed: {len(house_bills_to_process) + len(senate_bills_to_process)}")
+        if skipped_existing:
+            LOG.info(f"   Bills skipped (already in DB): {len(skipped_existing)}")
+            for bill_id in skipped_existing:
+                LOG.info(f"      - {bill_id}")
+        if skipped_invalid:
+            LOG.info(f"   Bills skipped (invalid): {len(skipped_invalid)}")
+        LOG.info(f"   House bills: {len(house_bills_to_process)}")
+        LOG.info(f"   Senate bills: {len(senate_bills_to_process)}")
+        LOG.info("=" * 60)
 
     LOG.info(f"📊 Bill monitoring complete - processed {processed_count} bills")
     return processed_count, posting_occurred
@@ -718,6 +857,7 @@ def main() -> int:
     aggregate_all = "--aggregate-all" in sys.argv
     # Support both "--continuous" and "--continous" (misspelling)
     continuous = "--continuous" in sys.argv or "--continous" in sys.argv
+    verbose_logging = "--verbose" in sys.argv or "-v" in sys.argv
 
     # Setup logging - use INFO level to show bill processing progress
     logging.basicConfig(
@@ -764,7 +904,7 @@ def main() -> int:
                         LOG.info("⏸️  Skipping X posting this cycle (waiting for next 3-hour cycle after last post)")
 
                     # Run monitoring
-                    processed, posting_occurred = monitor_and_process_bills(api_key, limit=100, post_to_x=should_post_to_x, aggregate_all=aggregate_all)
+                    processed, posting_occurred = monitor_and_process_bills(api_key, limit=100, post_to_x=should_post_to_x, aggregate_all=aggregate_all, verbose_logging=verbose_logging)
 
                     # Update posting cycle tracking
                     if posting_occurred:
@@ -787,7 +927,7 @@ def main() -> int:
     else:
         # Single run mode (existing behavior)
         try:
-            processed, posting_occurred = monitor_and_process_bills(api_key, limit=50, post_to_x=post_to_x, aggregate_all=aggregate_all)
+            processed, posting_occurred = monitor_and_process_bills(api_key, limit=50, post_to_x=post_to_x, aggregate_all=aggregate_all, verbose_logging=verbose_logging)
             if aggregate_all:
                 LOG.info(f"Monitoring session complete - {processed} bills aggregated and PNG created")
             elif post_to_x and posting_occurred:

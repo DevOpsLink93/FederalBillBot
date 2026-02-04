@@ -266,10 +266,14 @@ class XPoster:
                             tweet_text = tweet_text[:277] + "..."
 
                         if media_ids:
+                            # X.com API has a maximum of 4 media items per tweet
+                            limited_media_ids = media_ids[:4]
+                            if len(media_ids) > 4:
+                                LOG.warning(f"⚠️  X.com supports max 4 media per tweet, limiting {len(media_ids)} images to 4")
                             # Create tweet with media IDs using v2 API (broader access)
-                            response = client.create_tweet(text=tweet_text, media_ids=media_ids)
+                            response = client.create_tweet(text=tweet_text, media_ids=limited_media_ids)
                             tweet_id = response.data['id']
-                            LOG.info(f"✅ Posted tweet with {len(media_ids)} images to X.com - Tweet ID: {tweet_id}")
+                            LOG.info(f"✅ Posted tweet with {len(limited_media_ids)} images to X.com - Tweet ID: {tweet_id}")
                             posted_count = 1
                         else:
                             # Create tweet without media using v2 API
@@ -394,6 +398,7 @@ class XPoster:
             max_images_per_tweet = 4
             tweets_posted = 0
             total_images = len(image_paths)
+            main_tweet_id = None  # Track the first tweet for threading replies
 
             for tweet_idx in range(0, total_images, max_images_per_tweet):
                 try:
@@ -428,7 +433,10 @@ class XPoster:
                     # Create tweet text for this batch of images
                     images_shown = sum(10 for _ in image_chunk)  # Approximate bills shown
                     if total_chunks > 1:
-                        tweet_text = f"Introduced Legislation - {date_str} {time_str} EST. Tweet {chunk_num} of {total_chunks}. See images for bill details or visit https://tinyurl.com/recentbills"
+                        if chunk_num == 1:
+                            tweet_text = f"Introduced Legislation - {date_str} {time_str} EST. Tweet {chunk_num} of {total_chunks}. See images for bill details or visit https://tinyurl.com/recentbills"
+                        else:
+                            tweet_text = f"📋 Continuation: Tweet {chunk_num} of {total_chunks}. See images for additional bill details or visit https://tinyurl.com/recentbills"
                     else:
                         tweet_text = f"Introduced Legislation - {date_str} {time_str} EST. {total_images} image(s) with bill details. Visit https://tinyurl.com/recentbills"
 
@@ -438,7 +446,20 @@ class XPoster:
 
                     # Post tweet with images
                     try:
-                        response = client.create_tweet(text=tweet_text, media_ids=media_ids)
+                        # If this is not the first tweet and we have more than 1 chunk, reply to the main tweet
+                        if chunk_num > 1 and main_tweet_id:
+                            LOG.info(f"Posting tweet {chunk_num} as reply to main tweet {main_tweet_id}...")
+                            response = client.create_tweet(
+                                text=tweet_text, 
+                                media_ids=media_ids,
+                                in_reply_to_tweet_id=main_tweet_id,
+                                reply_settings="mentionedUsers"
+                            )
+                        else:
+                            # First tweet
+                            response = client.create_tweet(text=tweet_text, media_ids=media_ids)
+                            main_tweet_id = response.data['id']  # Store the ID for threading
+                        
                         tweet_id = response.data['id']
                         LOG.info(f"✅ Posted tweet {chunk_num}/{total_chunks} with {len(media_ids)} image(s) to X.com - Tweet ID: {tweet_id}")
                         tweets_posted += 1
@@ -478,3 +499,244 @@ class XPoster:
         except Exception as e:
             LOG.error(f"Failed to post images sequentially: {e}")
             return 0, 0
+
+    def post_bills_as_thread(self, house_bills: list, senate_bills: list, post_to_x: bool = False, create_png: bool = False, png_filename_base: str = "federal_bills") -> tuple[int, bool]:
+        """
+        Post House and Senate bills separately with independent threading.
+        
+        Posting logic:
+        - Post House bills as separate tweet(s) with overflow images in threads
+        - Post Senate bills as separate tweet(s) with overflow images in threads
+        - Each chamber has its own main tweet and thread (if images > 4)
+        - No cross-chamber threading
+        
+        Args:
+            house_bills: List of House bill data dictionaries
+            senate_bills: List of Senate bill data dictionaries
+            post_to_x: Whether to post to X.com
+            create_png: Whether to create PNG images
+            png_filename_base: Base filename for PNG images
+            
+        Returns:
+            Tuple of (total bills posted, whether posting was successful)
+        """
+        try:
+            # Deduplicate both lists
+            def deduplicate_bills(bills_list):
+                seen_bills = {}
+                deduplicated = []
+                for bill in bills_list:
+                    bill_id = bill.get('formatted_bill_number', '')
+                    if bill_id and bill_id not in seen_bills:
+                        seen_bills[bill_id] = True
+                        deduplicated.append(bill)
+                    elif not bill_id:
+                        deduplicated.append(bill)
+                return deduplicated
+            
+            house_bills = deduplicate_bills(house_bills)
+            senate_bills = deduplicate_bills(senate_bills)
+            
+            total_bills = len(house_bills) + len(senate_bills)
+            
+            # Check if we have any bills at all
+            if total_bills == 0:
+                LOG.info("No bills to post (neither House nor Senate)")
+                return 0, False
+            
+            LOG.info(f"📌 Separate posting: {len(house_bills)} House bills, {len(senate_bills)} Senate bills")
+            
+            # Initialize API for posting
+            client = None
+            api = None
+            if post_to_x:
+                try:
+                    from ..api.x_api_call import get_x_api_client, get_x_api
+                except ImportError:
+                    from pathlib import Path
+                    import sys
+                    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+                    from api.x_api_call import get_x_api_client, get_x_api
+                
+                try:
+                    client = get_x_api_client()
+                    api = get_x_api()
+                except Exception as e:
+                    LOG.error(f"Failed to initialize X API: {e}")
+                    return 0, False
+            
+            total_posted = 0
+            overall_success = True
+            
+            # Process House bills if they exist
+            if house_bills:
+                LOG.info(f"📍 Processing {len(house_bills)} House bills...")
+                # Insert chamber suffix before file extension
+                name_parts = png_filename_base.rsplit('.', 1)
+                house_filename = f"{name_parts[0]}-house.{name_parts[1]}" if len(name_parts) > 1 else f"{png_filename_base}-house"
+                house_success = self._post_bills_chamber(
+                    house_bills, "House", 
+                    post_to_x, client, api, create_png,
+                    house_filename
+                )
+                if house_success:
+                    total_posted += len(house_bills)
+                else:
+                    overall_success = False
+            
+            # Process Senate bills if they exist
+            if senate_bills:
+                LOG.info(f"📍 Processing {len(senate_bills)} Senate bills...")
+                # Insert chamber suffix before file extension
+                name_parts = png_filename_base.rsplit('.', 1)
+                senate_filename = f"{name_parts[0]}-senate.{name_parts[1]}" if len(name_parts) > 1 else f"{png_filename_base}-senate"
+                senate_success = self._post_bills_chamber(
+                    senate_bills, "Senate",
+                    post_to_x, client, api, create_png,
+                    senate_filename
+                )
+            
+            LOG.info(f"✅ Separate posting complete - {total_posted} total bills posted")
+            return total_posted, overall_success
+            
+        except Exception as e:
+            LOG.error(f"Failed to post bills separately: {e}")
+            return 0, False
+
+    def _post_bills_chamber(self, bills: list, chamber_label: str, post_to_x: bool, client, api, create_png: bool, png_filename_base: str) -> bool:
+        """
+        Post bills for a single chamber (House or Senate) with threading for overflow images.
+        
+        Args:
+            bills: List of bill data dictionaries for this chamber
+            chamber_label: "House Bills" or "Senate Bills"
+            post_to_x: Whether to post to X.com
+            client: X API v2 client
+            api: X API v1.1 client
+            create_png: Whether to create PNG images
+            png_filename_base: Base filename for PNG images
+            
+        Returns:
+            True if posting was successful, False otherwise
+        """
+        try:
+            LOG.info(f"Starting {chamber_label} posting...")
+            
+            # Create images for this chamber
+            image_paths = []
+            if create_png and bills:
+                LOG.info(f"Creating PNG images for {chamber_label}...")
+                image_paths = self.image_generator.create_multiple_bills_pngs(bills, png_filename_base)
+                if image_paths:
+                    LOG.info(f"✅ Created {len(image_paths)} image(s) for {chamber_label}")
+            
+            # Post bills to .txt file
+            bills_text = "\n".join([self.format_bill_text(bill) for bill in bills])
+            self.append_to_txt_file(bills_text, add_new_post_indicator=False)
+            
+            # Post to X.com if enabled
+            main_tweet_id = None
+            if post_to_x and client and api and image_paths:
+                try:
+                    # Upload main post images
+                    main_media_ids = []
+                    for image_path in image_paths:
+                        try:
+                            LOG.info(f"Uploading {chamber_label} image: {image_path}")
+                            media = api.media_upload(image_path)
+                            main_media_ids.append(str(media.media_id))
+                            LOG.info(f"✅ Uploaded {chamber_label} image - Media ID: {media.media_id}")
+                        except Exception as e:
+                            LOG.warning(f"Failed to upload {chamber_label} image {image_path}: {e}")
+                    
+                    # Create main post text
+                    est_tz = timezone(timedelta(hours=-5))
+                    est_time = datetime.now(est_tz)
+                    date_str = est_time.strftime('%Y-%m-%d')
+                    
+                    # Dynamic intro based on bill count
+                    if len(bills) <= 14:
+                        intro = f"🏛️ LATEST UPDATES: The {chamber_label.title()} introduced {len(bills)} new bills."
+                    else:
+                        intro = f"🚨 BUSY DAY ON THE HILL: A massive {len(bills)} new bills were just introduced in the {chamber_label.title()}!"
+                    
+                    # Combine with the standard footer
+                    main_tweet_text = f"{intro}\n\n📅 Date: {date_str}\n👇 See the breakdown in the attached images.\n🔗 Source: https://www.congress.gov/bills-with-chamber-action/browse-by-date"
+                    
+                    if len(main_tweet_text) > 280:
+                        main_tweet_text = main_tweet_text[:277] + "..."
+                    
+                    # Post main tweet (max 4 images)
+                    overflow_image_paths = []
+                    if main_media_ids:
+                        limited_main_media_ids = main_media_ids[:4]
+                        
+                        if len(main_media_ids) > 4:
+                            LOG.warning(f"⚠️  X.com supports max 4 media per tweet, posting 4 in main tweet and {len(main_media_ids) - 4} in thread reply")
+                            overflow_image_paths = image_paths[4:]
+                        
+                        response = client.create_tweet(text=main_tweet_text, media_ids=limited_main_media_ids)
+                        main_tweet_id = response.data['id']
+                        LOG.info(f"✅ Posted main {chamber_label} tweet to X.com - Tweet ID: {main_tweet_id}")
+                    
+                    # Post thread reply if there are overflow images
+                    if overflow_image_paths and main_tweet_id:
+                        LOG.info(f"Posting thread reply for {chamber_label} overflow images...")
+                        try:
+                            thread_media_ids = []
+                            for image_path in overflow_image_paths:
+                                try:
+                                    LOG.info(f"Uploading {chamber_label} thread image: {image_path}")
+                                    media = api.media_upload(image_path)
+                                    thread_media_ids.append(str(media.media_id))
+                                    LOG.info(f"✅ Uploaded {chamber_label} thread image - Media ID: {media.media_id}")
+                                except Exception as e:
+                                    LOG.warning(f"Failed to upload {chamber_label} thread image {image_path}: {e}")
+                            
+                            if thread_media_ids:
+                                thread_tweet_text = f"📋 {chamber_label} - Additional bill images (continuation)"
+                                if len(thread_tweet_text) > 280:
+                                    thread_tweet_text = thread_tweet_text[:277] + "..."
+                                
+                                limited_thread_media_ids = thread_media_ids[:4]
+                                if len(thread_media_ids) > 4:
+                                    LOG.warning(f"⚠️  Limiting thread reply to 4 media items")
+                                
+                                response = client.create_tweet(
+                                    text=thread_tweet_text,
+                                    reply_settings="mentionedUsers",
+                                    in_reply_to_tweet_id=main_tweet_id,
+                                    media_ids=limited_thread_media_ids
+                                )
+                                thread_tweet_id = response.data['id']
+                                LOG.info(f"✅ Posted {chamber_label} thread reply to X.com - Tweet ID: {thread_tweet_id}")
+                        
+                        except Exception as e:
+                            LOG.error(f"Failed to post {chamber_label} thread reply: {e}")
+                    
+                    # Archive images
+                    if image_paths:
+                        LOG.info(f"🔄 Archiving {chamber_label} images...")
+                        self.image_generator.archive_images(image_paths)
+                
+                except Exception as e:
+                    LOG.error(f"Failed to post {chamber_label} to X: {e}")
+                    return False
+            
+            # Store all bills in database
+            LOG.info(f"Saving {chamber_label} to database...")
+            bills_saved = 0
+            for bill_data in bills:
+                try:
+                    was_stored = self.store_in_database(bill_data)
+                    if was_stored:
+                        bills_saved += 1
+                except Exception as e:
+                    LOG.warning(f"Failed to store bill in database: {e}")
+            
+            LOG.info(f"✅ Successfully saved {bills_saved} out of {len(bills)} {chamber_label.lower()} to database")
+            return True
+            
+        except Exception as e:
+            LOG.error(f"Failed to post {chamber_label}: {e}")
+            return False
